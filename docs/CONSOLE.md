@@ -105,3 +105,54 @@ Unloading a model in the running app leaves part of its GPU memory held: with Qw
 ps5-homebrew-ui draws through ps5-opengl in the same title as RADV: the GL stack is linked as one object with only its GL/EGL API global (4,399 symbol names collide with RADV's Mesa otherwise), `sceAgcInit` runs once for both drivers (`--wrap`), and the GL runtime's thread-local initialiser `_ZTH23_mesa_glapi_tls_Context` is an empty function, as ProsperoAI has it. The screen costs about 0.35 GiB of the pool (11.38 to 11.03 GiB free). The app can be driven from a PC without a controller: `scripts/ps5lm-app.sh close|deploy|launch|screenshot|load|unload`.
 
 ShadowMountPlus registers a title once and copies its icon and backgrounds then; replacing them later needs a re-registration. Uninstalling to force one hit "Register failed: TitleDir bridge unavailable" after ShadowMountPlus had logged `stale cave bridge detached`; reloading ShadowMountPlus fixed it.
+
+## Starting it from the PC
+
+`ps5-homebrew-dev-protocol`, whose launch payload `scripts/ps5lm-app.sh launch`
+used to build, is not public any more (its repository answers 404). The
+replacement ships here: `ps5/launch/launch.c`, built by `scripts/build-launch.sh`
+into `build/launch/launch.elf` and sent to elfldr on 9021. It reads
+`/data/PS5LM/launch.txt` first — the title id on the first line, and optionally a
+`/data/homebrew/...` directory to hand to ShadowMountPlus's manual list — then
+launches the title through `sceSystemServiceLaunchApp`, refusing when another
+title is already running or nobody is signed in. `scripts/ps5lm-app.sh launch`
+writes that file and sends the payload, so the flow from the PC is still:
+
+```sh
+PS5_HOST=<console> scripts/ps5lm-app.sh deploy
+PS5_HOST=<console> scripts/ps5lm-app.sh launch
+```
+
+A title folder copied to `/data/homebrew/<id>` shows up in ShadowMountPlus by
+itself; the manual list is only for directories outside it.
+
+## Verifying introspection on a console
+
+`scripts/introspect-console-test.py` does the whole sequence from the PC: upload
+the title, write `launch.txt` and `model.txt`, send the launcher, wait for
+`/health`, then exercise the endpoint and print what came back.
+
+```sh
+python3 scripts/introspect-console-test.py --host <console> \
+    --title build/app-ps5/title/PPSA99575 \
+    --model /data/PS5LM/models/MiniCPM5-2B-Q8_0.gguf \
+    --json-out console-introspect.json
+```
+
+In order it checks: a plain chat completion (the normal path still works), logits
+at the last prompt position with entropy, one full-vocabulary row, a handful of
+activations, every prompt position, the chat-template path, and one intervention
+with the KL divergence of the top-10 distribution before and after. The JSON it
+writes is the record worth keeping: timings, argmax, tensor shapes and the app
+and server log tails.
+
+**[UNMEASURED on a console]** The run of this check on the 13.60 test console is
+pending: for part of the session the console answered on ftpsrv (2121), elfldr
+(9021), ShadowMountPlus (10101) and klogsrv (3232), and then stopped answering —
+host down, stale ARP entry — before the patched title could be launched. What is
+verified so far: the same code path built and exercised on a host CPU backend
+(logits, full rows, entropy, every position, activations, interventions, the byte
+budget, the disabled mode, `/completion` and `/v1/chat/completions` regression),
+and the artifact itself — built in the pinned Arch container, patch 0009
+reverse-checked in the tree, zero warnings, `strings eboot.bin` carrying
+`/v1/introspect`.
