@@ -5,6 +5,18 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Fixed
+- Logging no longer stalls the server. llama.cpp's log queue holds 512 lines, and when it was full
+  `common_log_add()` waited for the writer thread, which prints every line to `app.log` and to
+  `llama.log` with a flush each. Under a rapid introspection sweep (~180 lines a second) the writer
+  fell behind and the server thread froze mid-`print_timings`: `/slots` and `/metrics` hung while
+  `/health` stayed 200. On the console a full queue now drops the line and counts it, and the writer
+  logs `N log lines dropped, the log writer fell behind` once it catches up
+  (`patches/0010-log-never-blocks.patch`). With it, `LLAMA_ARG_LOG_VERBOSITY=2` in `env.txt`
+  should no longer be needed to keep a sweep alive. Not yet built or run on the console.
+
 ## [0.10.1] - 2026-10-18
 
 ### Fixed

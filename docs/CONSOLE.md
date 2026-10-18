@@ -106,6 +106,10 @@ ps5-homebrew-ui draws through ps5-opengl in the same title as RADV: the GL stack
 
 ShadowMountPlus registers a title once and copies its icon and backgrounds then; replacing them later needs a re-registration. Uninstalling to force one hit "Register failed: TitleDir bridge unavailable" after ShadowMountPlus had logged `stale cave bridge detached`; reloading ShadowMountPlus fixed it.
 
+### Logging must not block the server
+
+llama.cpp logs through one writer thread fed by a 512-line queue, and upstream a full queue makes the logging thread wait. In the app that writer prints every line twice, to `app.log` (stdout and stderr, which `main` reopens there) and to `--log-file llama.log`, flushing each time. A burst of introspection requests (~180 log lines a second) outran it, and the server thread stopped between two log calls: `/slots` and `/metrics` hung, `/health` still answered. `patches/0010-log-never-blocks.patch` makes a full queue drop the line on `__PROSPERO__`, and the writer then logs how many it dropped. A gap in the log is the price; the server keeps running. Not yet built or run on the console.
+
 ## Starting it from the PC
 
 `ps5-homebrew-dev-protocol`, whose launch payload `scripts/ps5lm-app.sh launch`
