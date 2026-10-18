@@ -233,6 +233,14 @@ struct UiFrameLog {
     int64_t     task_us[4] = {};            // scratch walk, market snapshot, log tail, model publish
     const char * task_name[4] = { "scratch", "market", "logs", "publish" };
     int         frames = 0, slow = 0, samples = 0, presses = 0, seconds = 0;
+    int         full_batches = 0;          // reads that came back at the 64-record cap
+    int         samples_frame = 0, full_frame = 0;
+
+    // The pad handed back `samples` records this frame, in `full` full batches.
+    void note_pad(int samples_now, int full_now) {
+        samples_frame += samples_now;
+        full_frame    += full_now;
+    }
 
     void open() {
         f = std::fopen("/data/PS5LM/ui.log", "wb");
@@ -254,9 +262,10 @@ struct UiFrameLog {
     }
 
     void frame(int64_t total_us, int64_t pad, int64_t snap, int64_t dash, int64_t draw, int64_t swap, int64_t work,
-               int samples_now, int presses_now) {
+               int presses_now) {
         frames += 1;
-        samples += samples_now;
+        samples += samples_frame;
+        full_batches += full_frame;
         presses += presses_now;
         frame_us += total_us;
         pad_us += pad;
@@ -288,14 +297,14 @@ struct UiFrameLog {
         seconds += 1;
         if (on()) {
             std::fprintf(f, "second %d frames=%d avg=%.1fms max=%.1fms slow=%d pad=%.2f snap=%.2f dash=%.2f draw=%.2f swap=%.2f work=%.2f "
-                            "tasks[scratch=%.1f market=%.1f logs=%.1f publish=%.1f] samples=%d presses=%d\n",
+                            "tasks[scratch=%.1f market=%.1f logs=%.1f publish=%.1f] samples=%d full_batches=%d presses=%d\n",
                          seconds, frames, frame_us / (1000.0 * frames), worst_us / 1000.0, slow, pad_us / (1000.0 * frames),
                          snap_us / (1000.0 * frames), dash_us / (1000.0 * frames), draw_us / (1000.0 * frames),
                          swap_us / (1000.0 * frames), work_us / (1000.0 * frames), task_us[0] / 1000.0, task_us[1] / 1000.0,
-                         task_us[2] / 1000.0, task_us[3] / 1000.0, samples, presses);
+                         task_us[2] / 1000.0, task_us[3] / 1000.0, samples, full_batches, presses);
             std::fflush(f);
         }
-        frames = slow = samples = presses = 0;
+        frames = slow = samples = presses = full_batches = samples_frame = full_frame = 0;
         frame_us = pad_us = snap_us = dash_us = draw_us = swap_us = work_us = worst_us = 0;
         worst = "";
         for (int64_t & v : task_us) {
@@ -861,7 +870,8 @@ int main(int, char **) {
     market.start(models.budget_gib);
     int  saved_seen = 0;  // downloads finished, as last seen
     dash.set_settings(models.settings);
-    bool      scratch_warned = false;
+    std::atomic<bool> scratch_warned{false};
+    std::atomic<bool> scratch_walking{false};
     // Downloads left queued or running carry on, on their own page.
     unlink("/data/PS5LM/download.txt");  // the queue file replaced this one (v0.7.0)
     market.load_queue();
@@ -886,8 +896,23 @@ int main(int, char **) {
         last = now;
 
         const int64_t u_frame = now;
-        const size_t count = pad.read(samples);
-        const hui::InputFrame input = tracker.update(std::span<const hui::PadSample>(samples, count), (uint64_t) now);
+        // PS5LM fork: scePadRead hands back at most 64 records per call, and the
+        // pad can produce more than that between two frames when a frame runs long
+        // (over Bluetooth especially). Drain until a short read, or the overflow is
+        // lost silently, and count the full reads so /data/PS5LM/ui.log shows it.
+        size_t count = 0;
+        int pad_full = 0;
+        hui::InputFrame input;
+        for (int batch = 0; batch < 8; ++batch) {
+            const size_t got = pad.read(samples);
+            input = tracker.update(std::span<const hui::PadSample>(samples, got), (uint64_t) now);
+            count += got;
+            if (got < sizeof(samples) / sizeof(samples[0])) {
+                break;  // the queue is drained
+            }
+            pad_full += 1;
+        }
+        ui_log.note_pad((int) count, pad_full);
         const int64_t u_pad = hui::sys::monotonic_us();
         Live live = stats.snapshot();
         const int64_t u_snap = hui::sys::monotonic_us();
@@ -967,19 +992,24 @@ int main(int, char **) {
 
         // The scratch folder: its size for the dashboard, and one warning each
         // time it grows past the limit.
-        if (n % 600 == 300) {
-            const int64_t t_scratch = hui::sys::monotonic_us();
-            const double gib = folder_bytes(kScratch) / 1073741824.0;
-            ui_log.task(0, hui::sys::monotonic_us() - t_scratch);
-            stats.set_scratch(gib);
-            const bool over = gib > models.settings.scratch_limit_gib;
-            if (over && !scratch_warned) {
-                char text[128];
-                std::snprintf(text, sizeof(text), "PS5LM: the chat's scratch folder holds %.1f GiB; clear it in Settings", gib);
-                notify(text);
-                std::printf("ps5lm-app: %s\n", text + 7);
-            }
-            scratch_warned = over;
+        // PS5LM fork: that walk reads every file under the folder. It used to run
+        // here, on the render thread, every ten seconds, where a big folder is a
+        // visible freeze. It runs on its own thread now.
+        if (n % 600 == 300 && !scratch_walking.exchange(true)) {
+            const double limit = models.settings.scratch_limit_gib;
+            std::thread([&stats, &scratch_warned, &scratch_walking, limit] {
+                const double gib = folder_bytes(kScratch) / 1073741824.0;
+                stats.set_scratch(gib);
+                const bool over = gib > limit;
+                if (over && !scratch_warned.exchange(true)) {
+                    char text[128];
+                    std::snprintf(text, sizeof(text), "PS5LM: the chat's scratch folder holds %.1f GiB; clear it in Settings", gib);
+                    notify(text);
+                    std::printf("ps5lm-app: %s\n", text + 7);
+                }
+                scratch_warned = over;
+                scratch_walking = false;
+            }).detach();
         }
         if (n % 10 == 0) {
             const int64_t t_market = hui::sys::monotonic_us();
@@ -1079,6 +1109,7 @@ int main(int, char **) {
             for (const auto & e : std::filesystem::directory_iterator(kScratch, ec)) {
                 std::filesystem::remove_all(e.path(), ec);
             }
+            scratch_warned = false;
             stats.set_scratch(folder_bytes(kScratch) / 1073741824.0);
             notify("PS5LM: scratch folder cleared");
             std::printf("ps5lm-app: scratch folder cleared\n");
