@@ -11,10 +11,16 @@ llama-server. That is the point: when llama-server's main loop is stuck, `/healt
 answers 200 while `/slots`, `/metrics` and every completion hang. Anything that goes through the
 server's task queue hangs with them. The control port never does.
 
-> **Status: unbuilt on the console.** The code was written on a Mac and checked there with
-> `scripts/control-host-test.sh` (the control port in front of a fake llama-server that can be made
-> to wedge; 22 checks). It has not been compiled with the PS5 SDK or run on a console yet. The
-> checks to make there are at the end of this page.
+> **Status: run on the console** (2026-10-18, MiniCPM5-2B Q8_0, built with the PS5 SDK on Linux).
+> `/ping`, the token (401 without it), `/status`, `/logs`, `PATCH /env`, a clean `/restart` (43 s
+> back to `ready` with a new `boot_id`), `/load` and the `no_model` verdict all worked. For the wedge
+> test, a build without the logging fix (patch 0010) was wedged on purpose by a rapid
+> `/v1/introspect` sweep. The verdict went `ready`, `busy`, `slow`, `wedged` while `/health` stayed
+> 200. `ps5lm_ctl.py ensure` restarted it hard and it was `ready` 68 s later, with nobody at the
+> console. With `watchdog_s: 60`, a second reproduced wedge was restarted by the watchdog on its own
+> (`control-restarts.txt`: "the main loop finished no task for 62 s"). Not checked yet: items 7 and
+> 10 below. Right after a launch from the PC, 8083 can refuse connections for a minute or two while
+> the app starts and relaunches itself onto the whole memory pool; `wait-ready` covers that.
 
 ## Quick start
 

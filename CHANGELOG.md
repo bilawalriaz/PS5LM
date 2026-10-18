@@ -26,7 +26,8 @@ v0.1.x are the upstream payload releases by cobanov.
   over FTP. Standard library only, and importable (`Control.ensure_ready()`).
 - `scripts/control-host-test.sh` runs the control port on a PC against a fake llama-server that can
   be made to wedge (22 checks).
-- Not yet built or run on the console; the checks to make there are in docs/CONTROL.md.
+- Run on the console: status, logs, env, clean and hard restarts, and recovery from a real wedge,
+  both by `ensure` (68 s) and by the watchdog on its own. Details in docs/CONTROL.md.
 
 ### Fixed
 - Logging no longer stalls the server. llama.cpp's log queue holds 512 lines, and when it was full
