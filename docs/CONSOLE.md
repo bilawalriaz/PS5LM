@@ -146,13 +146,29 @@ with the KL divergence of the top-10 distribution before and after. The JSON it
 writes is the record worth keeping: timings, argmax, tensor shapes and the app
 and server log tails.
 
-**[UNMEASURED on a console]** The run of this check on the 13.60 test console is
-pending: for part of the session the console answered on ftpsrv (2121), elfldr
-(9021), ShadowMountPlus (10101) and klogsrv (3232), and then stopped answering —
-host down, stale ARP entry — before the patched title could be launched. What is
-verified so far: the same code path built and exercised on a host CPU backend
-(logits, full rows, entropy, every position, activations, interventions, the byte
-budget, the disabled mode, `/completion` and `/v1/chat/completions` regression),
-and the artifact itself — built in the pinned Arch container, patch 0009
-reverse-checked in the tree, zero warnings, `strings eboot.bin` carrying
-`/v1/introspect`.
+### What the check returned (2026-10-18, firmware 13.60)
+
+Run against the release `v0.10.0` artifact (`eboot.bin` sha256
+`ebaea7d0c28cba06f8a9135d023dd68d7b22bb0a48623181e60954014df5aef0`), on MiniCPM5-2B Q8_0
+(2.68 GB) loaded on the GPU with `-c 65536`, server build `b11608-04f7226a2`. The whole
+suite above passed:
+
+| Step | Result |
+|---|---|
+| Launch to `/health` (model load included) | 77 s |
+| Logits at the last prompt position | 0.07 s, entropy 1.628 nats, argmax `' there'` (14.26) |
+| Full vocabulary row | 1.13 s, 522,240 bytes = 130,560 float32 = exactly `n_vocab` |
+| 13 activation tensors (l_out/ffn_out/attn_out for layers 0, 1, 2, 12, plus `result_norm`) | 0.20 s, 2048 floats each |
+| Every prompt position (4 tokens) | 0.27 s |
+| Chat-template path | 0.08 s, 15 rendered tokens, argmax `'We'` |
+| Intervention: zero `ffn_out-12` channels 0..4095 | 0.10 s, `modified: 20480` (4096 x 5 rows), argmax `' there'` -> `' a'`, top-10 KL 0.915 nats |
+| `positions: "all"` over a 103-token prompt, 2 tensors x 3 layers | 1.51 s, 103 entries, 6.86 MB JSON, `truncated: false` |
+| `/completion`, `/v1/chat/completions` | unaffected (the chat path answers in `reasoning_content`, a reasoning model's channel) |
+
+The cross-check that matters for the Vulkan path: the same token's nine captured tensors,
+and its logits, are **byte-identical** whether they came from the batched prefill
+(`positions: "last"`) or from one-token-at-a-time decoding (`positions: "all"`) — so the
+`cb_eval` capture returns the same rows on the GPU backend as on the CPU one.
+
+Measured limits: 103 tokens of stepping cost 1.51 s, i.e. the console sustains roughly
+70 tokens/s while capturing activations for six tensors per position.

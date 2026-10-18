@@ -218,10 +218,15 @@ Set in `/data/PS5LM/env.txt` (one `NAME=value` per line; the app applies
 
 ## Status
 
-- The patch builds and is exercised on the host (macOS, CPU backend) with a
-  small test model: logits, full rows, entropy, all-positions capture, the
-  chat-template path, the byte budget and the disabled mode were all run, and
-  the same token's activations match between the batched and step-by-step
-  paths.
-- On the console (PS5, ggml-vulkan on RADV) see
-  `docs/CONSOLE.md#introspection` for what has been measured there.
+- [LOCALLY BUILT] The patch builds and is exercised on the host (macOS, CPU
+  backend) with a small test model: logits, full rows, entropy, all-positions
+  capture, the chat-template path, the budget, the disabled mode and
+  interventions were all run.
+- [TESTED-ON-CONSOLE] Run on a 13.60 PS5 with MiniCPM5-2B Q8_0 on the GPU
+  (ggml-vulkan on RADV), release v0.10.0: logits, a full row of exactly
+  `n_vocab` floats, 13 activation tensors for four layers, every prompt
+  position, the chat-template path, and one intervention that changed 20,480
+  elements and moved the argmax with a top-10 KL of 0.915 nats. The same
+  token's nine tensors are byte-identical between batched and step-by-step
+  capture, which is what validates the graph-eval capture on the GPU backend.
+  Numbers: `docs/CONSOLE.md` (What the check returned).

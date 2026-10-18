@@ -21,6 +21,15 @@ v0.1.x are the upstream payload releases by cobanov.
 - `LLAMA_INTROSPECT` and `LLAMA_INTROSPECT_MAX_BYTES` in `/data/PS5LM/env.txt`: the endpoint is on by
   default and one request may return at most 256 MiB of activations.
 
+### Verified on a console
+- [TESTED-ON-CONSOLE] The 0.10.0 artifact ran on a 13.60 PS5 with MiniCPM5-2B Q8_0 on the GPU
+  (ggml-vulkan on RADV, `-c 65536`, server build `b11608-04f7226a2`): logits with entropy at the last
+  prompt position in 0.07 s, a full vocabulary row of 130,560 float32, 13 activation tensors of 2048
+  floats for layers 0/1/2/12 plus `result_norm`, every prompt position, the chat-template path, and an
+  intervention that changed 20,480 elements and moved the argmax with a top-10 KL of 0.915 nats. The
+  same token's tensors are byte-identical between batched and step-by-step capture. `docs/CONSOLE.md`
+  has the table.
+
 ### Changed
 - The request feed on Home ignores introspection requests: their answers are raw numbers, and one of
   them can be hundreds of megabytes, which the feed would only parse to show nothing.
