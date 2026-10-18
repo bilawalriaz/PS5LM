@@ -79,8 +79,10 @@ index 60c5633..8d21298 100644
 +        // the feature needs no callback at all: it reads the context's output
 +        // buffer, which llama.cpp fills for every batch row that asks for it.
 +        {
++            // Off unless asked for: the app's Developer setting sets this before
++            // the server starts, and env.txt can set it for a build without the row.
 +            const char * env = getenv("LLAMA_INTROSPECT");
-+            introspect_enabled = env == nullptr || atoi(env) != 0;
++            introspect_enabled = env != nullptr && atoi(env) != 0;
 +            const char * env_bytes = getenv("LLAMA_INTROSPECT_MAX_BYTES");
 +            if (env_bytes != nullptr && atoll(env_bytes) > 0) {
 +                introspect_max_bytes = atoll(env_bytes);

@@ -214,7 +214,7 @@ Set in `/data/PS5LM/env.txt` (one `NAME=value` per line; the app applies
 
 | Name | Default | Meaning |
 |---|---|---|
-| `LLAMA_INTROSPECT` | `1` | `0` disables the endpoint (it then answers 501) |
+| `LLAMA_INTROSPECT` | off | Set it to `1` to enable the endpoint. Settings > Developer > "Logits and activations API" sets it for you |
 | `LLAMA_INTROSPECT_MAX_BYTES` | `268435456` | Cap on the activations one request may return |
 
 ## What this does not give you

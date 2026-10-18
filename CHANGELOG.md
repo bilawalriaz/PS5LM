@@ -31,8 +31,9 @@ v0.1.x are the upstream payload releases by cobanov.
   neuron, an attention-head dimension) or a range, at every position or at one named position. The
   answer reports how many elements each intervention changed, and the prompt cache is dropped after a
   pass that was intervened.
-- `LLAMA_INTROSPECT` and `LLAMA_INTROSPECT_MAX_BYTES` in `/data/PS5LM/env.txt`: the endpoint is on by
-  default and one request may return at most 256 MiB of activations.
+- **The endpoint is off by default**: Settings > Developer > "Logits and activations API" turns it on,
+  and it sets `LLAMA_INTROSPECT=1` for the server. `LLAMA_INTROSPECT_MAX_BYTES` caps the activations in
+  one answer (256 MiB).
 
 ### Verified on a console
 - [TESTED-ON-CONSOLE] The 0.10.0 artifact ran on a 13.60 PS5 with MiniCPM5-2B Q8_0 on the GPU
