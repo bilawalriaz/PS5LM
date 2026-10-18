@@ -102,7 +102,7 @@ LFM2 and most GGUFs declare):
 
 | Tensor | What it is |
 |---|---|
-| `embd` | The token embedding + position row: the input of block 0 |
+| `embd` | The token embedding row of each position (positions enter later, inside attention's RoPE) |
 | `attn_norm-<il>` | Residual stream after the block's input norm |
 | `kqv_out-<il>` | The fused Q/K/V projection output |
 | `attn_out-<il>` | Attention output, before the residual add |

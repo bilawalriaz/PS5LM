@@ -217,6 +217,93 @@ uint64_t folder_bytes(const char * path) {
     return total;
 }
 
+// PS5LM fork: a frame-time log. A stall the user feels ("the screen stopped
+// answering for a second") leaves no trace in the server's metrics, so the
+// loop times itself: one line each second, and one line for every frame that
+// goes over the budget, with the part of the frame that took the time. It also
+// counts pad samples and presses, which is how a lost press is told apart from
+// a press the app never saw.
+struct UiFrameLog {
+    static constexpr int64_t kSlowUs = 33000;  // 33 ms: two frames at 60 Hz
+
+    std::FILE * f = nullptr;
+    int64_t     frame_us = 0, pad_us = 0, snap_us = 0, dash_us = 0, draw_us = 0, swap_us = 0, work_us = 0;
+    int64_t     worst_us = 0;
+    const char * worst   = "";
+    int64_t     task_us[4] = {};            // scratch walk, market snapshot, log tail, model publish
+    const char * task_name[4] = { "scratch", "market", "logs", "publish" };
+    int         frames = 0, slow = 0, samples = 0, presses = 0, seconds = 0;
+
+    void open() {
+        f = std::fopen("/data/PS5LM/ui.log", "wb");
+        if (f != nullptr) {
+            std::fprintf(f, "# frame times; one line a second, and one per slow frame\n");
+            std::fflush(f);
+        }
+    }
+
+    bool on() const { return f != nullptr; }
+
+    void task(int slot, int64_t us) {
+        task_us[slot] += us;
+        work_us       += us;
+        if (us > worst_us) {
+            worst_us = us;
+            worst    = task_name[slot];
+        }
+    }
+
+    void frame(int64_t total_us, int64_t pad, int64_t snap, int64_t dash, int64_t draw, int64_t swap, int64_t work,
+               int samples_now, int presses_now) {
+        frames += 1;
+        samples += samples_now;
+        presses += presses_now;
+        frame_us += total_us;
+        pad_us += pad;
+        snap_us += snap;
+        dash_us += dash - tasks;  // the periodic tasks are reported in tasks[]
+        draw_us += draw;
+        swap_us += swap;
+        work_us += work;
+        if (total_us > kSlowUs) {
+            slow += 1;
+            if (on()) {
+                std::fprintf(f, "slow frame %d total=%.1fms pad=%.2f snap=%.2f dash=%.2f draw=%.2f swap=%.2f work=%.2f (slowest %.1fms %s)\n",
+                             frames, total_us / 1000.0, pad / 1000.0, snap / 1000.0, dash / 1000.0, draw / 1000.0,
+                             swap / 1000.0, work / 1000.0, worst_us / 1000.0, worst);
+                std::fflush(f);
+            }
+        }
+        // the periodic tasks were timed inside the dash phase; report them apart
+        int64_t tasks = 0;
+        for (const int64_t v : task_us) {
+            tasks += v;
+        }
+        if (dash < tasks) {
+            tasks = dash;
+        }
+        if (frames % 60 != 0) {
+            return;
+        }
+        seconds += 1;
+        if (on()) {
+            std::fprintf(f, "second %d frames=%d avg=%.1fms max=%.1fms slow=%d pad=%.2f snap=%.2f dash=%.2f draw=%.2f swap=%.2f work=%.2f "
+                            "tasks[scratch=%.1f market=%.1f logs=%.1f publish=%.1f] samples=%d presses=%d\n",
+                         seconds, frames, frame_us / (1000.0 * frames), worst_us / 1000.0, slow, pad_us / (1000.0 * frames),
+                         snap_us / (1000.0 * frames), dash_us / (1000.0 * frames), draw_us / (1000.0 * frames),
+                         swap_us / (1000.0 * frames), work_us / (1000.0 * frames), task_us[0] / 1000.0, task_us[1] / 1000.0,
+                         task_us[2] / 1000.0, task_us[3] / 1000.0, samples, presses);
+            std::fflush(f);
+        }
+        frames = slow = samples = presses = 0;
+        frame_us = pad_us = snap_us = dash_us = draw_us = swap_us = work_us = worst_us = 0;
+        worst = "";
+        for (int64_t & v : task_us) {
+            v = 0;
+        }
+    }
+};
+
 // A system notification on the TV.
 void notify(const char * text) {
     struct {
@@ -787,6 +874,8 @@ int main(int, char **) {
     }
     hui::ui::Feedback feedback;
     hui::PadSample samples[64];
+    UiFrameLog ui_log;  // PS5LM fork: frame times, for stalls the user feels
+    ui_log.open();
     int64_t last = hui::sys::monotonic_us();
     bool was_serving = false;
     bool rescanning = false;
@@ -796,9 +885,16 @@ int main(int, char **) {
         const float dt = n == 0 ? 1.0f / 60.0f : std::min(0.05f, (float) (now - last) / 1e6f);
         last = now;
 
+        const int64_t u_frame = now;
         const size_t count = pad.read(samples);
         const hui::InputFrame input = tracker.update(std::span<const hui::PadSample>(samples, count), (uint64_t) now);
+        const int64_t u_pad = hui::sys::monotonic_us();
         Live live = stats.snapshot();
+        const int64_t u_snap = hui::sys::monotonic_us();
+        int ui_presses = 0;
+        for (unsigned b = 0; b < 32; ++b) {
+            ui_presses += (input.pressed >> b) & 1u;
+        }
         if (g_server_rc >= 0 && live.state != ServerState::failed && live.state != ServerState::no_model) {
             stats.set_state(ServerState::failed);
             const bool projector = std::find(g_server_args.begin(), g_server_args.end(), "--mmproj") != g_server_args.end();
@@ -819,7 +915,9 @@ int main(int, char **) {
         }
         was_serving = serving;
         if (n % 30 == 0) {
+            const int64_t t = hui::sys::monotonic_us();
             models.publish(stats);
+            ui_log.task(3, hui::sys::monotonic_us() - t);
         }
         dash.set_live(live);
         feedback.clear();
@@ -855,6 +953,7 @@ int main(int, char **) {
             }
         }
         dash.update(in, dt, feedback);
+        const int64_t u_dash = hui::sys::monotonic_us();
         for (const auto & cue : feedback.cues) {
             if (!models.settings.sounds) {
                 break;
@@ -869,7 +968,9 @@ int main(int, char **) {
         // The scratch folder: its size for the dashboard, and one warning each
         // time it grows past the limit.
         if (n % 600 == 300) {
+            const int64_t t_scratch = hui::sys::monotonic_us();
             const double gib = folder_bytes(kScratch) / 1073741824.0;
+            ui_log.task(0, hui::sys::monotonic_us() - t_scratch);
             stats.set_scratch(gib);
             const bool over = gib > models.settings.scratch_limit_gib;
             if (over && !scratch_warned) {
@@ -881,7 +982,9 @@ int main(int, char **) {
             scratch_warned = over;
         }
         if (n % 10 == 0) {
+            const int64_t t_market = hui::sys::monotonic_us();
             MarketView mv = market.snapshot();
+            ui_log.task(1, hui::sys::monotonic_us() - t_market);
             // A finished download joins the library.
             if (mv.saved != saved_seen) {
                 saved_seen = mv.saved;
@@ -891,7 +994,9 @@ int main(int, char **) {
             dash.set_market(std::move(mv));
         }
         if (dash.wants_logs() && n % 60 == 0) {
+            const int64_t t_logs = hui::sys::monotonic_us();
             dash.set_logs(tail_lines(kLog), tail_lines(kLlamaLog));
+            ui_log.task(2, hui::sys::monotonic_us() - t_logs);
         }
 
         // A settings rescan in the background: say so until it lands.
@@ -911,6 +1016,8 @@ int main(int, char **) {
             models.stop();
             sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
         }
+
+        const int64_t u_work = hui::sys::monotonic_us();
 
         Dashboard::Request req = dash.take_request();
         if (req.kind == Dashboard::Request::settings) {
@@ -1012,16 +1119,29 @@ int main(int, char **) {
             restart_at = n + 3;  // three frames with the busy screen on the TV first
         }
 
+        int64_t u_draw = u_work;
         if (ui_ok) {
             render();
+            u_draw = hui::sys::monotonic_us();
             if (n % 60 == 45 && !take_request_file("/data/PS5LM/screenshot").empty()) {
                 const bool ok = save_screen("/data/PS5LM/screen.bmp", display.width(), display.height());
                 std::printf("ps5lm-app: screenshot %s\n", ok ? "saved" : "failed");
             }
         }
         display.swap();
+        const int64_t u_swap = hui::sys::monotonic_us();
         if (n % 60 == 0) {
             quit_if_asked();
         }
+        // total, pad, snap, dash, draw, swap, work, pad samples, presses this frame
+        ui_log.frame(u_swap - u_frame,
+                     u_pad - u_frame,
+                     u_snap - u_pad,
+                     u_dash - u_snap,
+                     u_draw - u_work,
+                     u_swap - u_draw,
+                     u_work - u_dash,
+                     (int) count,
+                     ui_presses);
     }
 }
