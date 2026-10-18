@@ -7,6 +7,27 @@ v0.1.x are the upstream payload releases by cobanov.
 
 ## [Unreleased]
 
+### Added
+- **The control port** (8083), an HTTP API for agents and scripts that use the console as an
+  inference server and must get it back when it gets stuck. `GET /status` gives a verdict (`ready`,
+  `busy`, `slow`, `wedged`, `loading`, `restarting`, `no_model`, `failed`) together with `/health`,
+  the age of the last task llama-server's main loop finished, the model, memory and load.
+  `POST /restart` restarts with the same model, another model or other arguments: clean, or `hard`
+  for a wedged server. `POST /load` and `POST /unload` switch or drop the model.
+  `GET /logs/{llama,app,ui,restarts}` returns a log's tail or reads from an offset. `env.txt`,
+  `settings.json` (`introspect`, `ctx_cap`, ...) and a watchdog (off by default) can be read and
+  changed. It runs in the app on its own threads, outside llama-server, so it answers when the
+  server's main loop is stuck and `/health` is the only thing that still does. A restart the main
+  loop does not carry out within 8 s (hard) or 30 s (clean) is done by the control thread itself.
+  Every route but `/ping` needs the token in `/data/PS5LM/control-token.txt`.
+  See [docs/CONTROL.md](docs/CONTROL.md).
+- `scripts/ps5lm_ctl.py`, the client: `status`, `ensure` (ready, or restart and wait), `restart`,
+  `load`, `unload`, `wait-ready`, `logs --follow`, `env`, `settings`, `watchdog`. It finds the token
+  over FTP. Standard library only, and importable (`Control.ensure_ready()`).
+- `scripts/control-host-test.sh` runs the control port on a PC against a fake llama-server that can
+  be made to wedge (22 checks).
+- Not yet built or run on the console; the checks to make there are in docs/CONTROL.md.
+
 ### Fixed
 - Logging no longer stalls the server. llama.cpp's log queue holds 512 lines, and when it was full
   `common_log_add()` waited for the writer thread, which prints every line to `app.log` and to

@@ -239,7 +239,9 @@ void StatsCollector::start(int port) {
 
 Live StatsCollector::snapshot() {
     std::lock_guard<std::mutex> lock(mutex_);
-    return live_;
+    Live out = live_;
+    out.metrics_age_s = metrics_at_ < 0 ? -1 : now_s() - metrics_at_;
+    return out;
 }
 
 void StatsCollector::set_model(const Live & m) {
@@ -348,6 +350,7 @@ void StatsCollector::run() {
         // Only real metrics: while the model loads the server already answers,
         // with 503 "Loading model", and that is not ready.
         const bool        up = m.find("llamacpp:") != std::string::npos;
+        const double      answered_at = now_s();
         const double busy_s = metric(m, "prompt_seconds_total") + metric(m, "tokens_predicted_seconds_total");
         const double tokens = metric(m, "tokens_predicted_total");
         const double gen_s  = metric(m, "tokens_predicted_seconds_total");
@@ -460,6 +463,7 @@ void StatsCollector::run() {
         }
         push(live_.cpu_history, live_.cpu_use);
         if (up) {
+            metrics_at_ = answered_at;
             if (live_.state == ServerState::loading || live_.state == ServerState::ready ||
                 live_.state == ServerState::generating) {
                 live_.state = working ? ServerState::generating : ServerState::ready;

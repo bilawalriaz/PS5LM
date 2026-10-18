@@ -27,4 +27,10 @@ struct Settings {
 Settings load_settings(const char * path);
 bool     save_settings(const char * path, const Settings & s);
 
+// The control port's view (control.cpp): the settings as one JSON object, and
+// a partial object applied over them. A key that is unknown, of the wrong
+// type or out of range is refused with `error` and changes nothing.
+std::string settings_json(const Settings & s);
+bool        patch_settings(const std::string & json_text, Settings * s, std::string * error);
+
 }  // namespace ps5lm

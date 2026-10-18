@@ -116,6 +116,10 @@ struct Live {
     uint64_t prompt_tokens = 0;
     uint64_t requests  = 0;
     uint32_t ctx_used  = 0;  // in the running slot
+    // Seconds since /metrics last answered, or -1 before it ever did. Each
+    // answer is a task llama-server's main loop finished, so a server whose
+    // /health answers while this grows is wedged (docs/CONTROL.md).
+    double   metrics_age_s = -1;
 
     std::vector<ModelRow> models;
     std::vector<Exchange> activity;  // the latest requests, oldest first
@@ -143,6 +147,7 @@ class StatsCollector {
     std::mutex mutex_;
     Live       live_;
     double     load_base_ = -1;   // pool in use when the load began
+    double     metrics_at_ = -1;  // steady seconds of the last /metrics answer
     int        port_ = 8081;
 };
 

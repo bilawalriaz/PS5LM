@@ -8,7 +8,8 @@
 // the interface sounds. Models come from /data/PS5LM/models and USB drives; the
 // planner (model_plan.cpp) picks each one's context and cache for the memory
 // free. /data/PS5LM/app-args.txt, one argument per line, overrides all of it.
-// The app logs to /data/PS5LM/app.log and llama.log.
+// The app logs to /data/PS5LM/app.log and llama.log. Port 8083 is the control
+// API for agents (control.cpp, docs/CONTROL.md): status, restarts, logs.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -38,6 +39,7 @@
 
 #include <GL/glcorearb.h>
 
+#include "control.hpp"
 #include "dashboard.hpp"
 #include "fetch.hpp"
 #include "market.hpp"
@@ -113,6 +115,7 @@ constexpr const char * kLlamaLog    = "/data/PS5LM/llama.log";
 constexpr const char * kModels      = "/data/PS5LM/models";
 constexpr const char * kAssets      = "/app0/assets";
 constexpr int          kPort        = 8081;
+constexpr int          kControlPort = 8083;
 const std::vector<std::string> kModelDirs = { kModels, "/mnt/ext0/PS5LM/models", "/mnt/usb0/PS5LM/models",
                                               "/mnt/usb1/PS5LM/models", "/mnt/usb0", "/mnt/usb1" };
 
@@ -739,6 +742,10 @@ int main(int, char **) {
     StatsCollector stats;
     stats.start(kPort);
     set_activity_sink(&stats);  // llama-server's request hooks (patches/0007) report here
+    // The control port, before the GPU opens: a restart works from here on,
+    // even while the boot below is stuck (its fallback LoadExecs by itself).
+    Control control;
+    control.start(kControlPort, kPort, "/data/PS5LM", &stats);
     Models models;
     models.settings = load_settings(kSettings);
     // The model about to load, by name, for Home while the GPU opens.
@@ -897,6 +904,7 @@ int main(int, char **) {
     bool was_serving = false;
     bool rescanning = false;
     uint64_t restart_at = 0;  // the frame to stop the model and restart on, or 0
+    bool restart_hard = false;  // the control port's hard restart: LoadExec without stopping the server
     for (uint64_t n = 0;; ++n) {
         const int64_t now = hui::sys::monotonic_us();
         const float dt = n == 0 ? 1.0f / 60.0f : std::min(0.05f, (float) (now - last) / 1e6f);
@@ -1047,10 +1055,30 @@ int main(int, char **) {
             rescanning = false;
             dash.set_busy("");
         }
+        // The control port's requests (control.cpp has written model.txt and
+        // app-args.txt already): settings it saved, and restarts.
+        for (ControlAction a; control.take(&a);) {
+            if (a.kind == ControlAction::settings) {
+                const Settings was = models.settings;
+                models.settings = a.saved;
+                dash.set_settings(models.settings);
+                if (was.ctx_cap != models.settings.ctx_cap || was.kv_type != models.settings.kv_type) {
+                    models.rescan(stats);
+                }
+            } else if (a.kind == ControlAction::restart && restart_at == 0) {
+                dash.set_busy(a.busy, a.detail);
+                restart_hard = a.hard;
+                restart_at = n + 3;
+            }
+        }
         // A restart asked for a few frames ago, once the busy screen is up.
+        // A hard one skips the clean stop: a wedged server does not stop, and
+        // llama_server_terminate() can block behind it.
         if (restart_at != 0 && n >= restart_at) {
-            std::fflush(nullptr);
-            models.stop();
+            if (!restart_hard) {
+                std::fflush(nullptr);
+                models.stop();
+            }
             sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
         }
 

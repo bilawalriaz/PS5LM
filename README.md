@@ -109,6 +109,10 @@ python3 scripts/ps5lm-introspect.py --host <console> --prompt "Once upon a time"
 Reference and costs: [docs/INTROSPECTION.md](docs/INTROSPECTION.md), patch
 [0009](patches/0009-introspection-logits-and-activations.patch).
 
+For long unattended runs the app has a control port (8083). It reports whether the server's main
+loop still answers, and restarts or reloads the model when it does not, with nobody at the console:
+`python3 scripts/ps5lm_ctl.py ensure`. See [docs/CONTROL.md](docs/CONTROL.md).
+
 `llama-inspect` is the standalone tool: one model on one context and one request at a time, so a
 capture is always the whole batch and a tensor's second dimension is always the token index.
 
@@ -175,7 +179,7 @@ ggml-vulkan on [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan)'s RADV, bui
 
 [Building](docs/BUILDING.md) · [Console notes](docs/CONSOLE.md) · [Porting](docs/PORTING.md) ·
 [Research](docs/RESEARCH.md) · [Models that fit](docs/MODELS.md) · [Roadmap](docs/ROADMAP.md) ·
-[Changelog](CHANGELOG.md) · [The original payload](docs/PAYLOAD.md)
+[Control port](docs/CONTROL.md) · [Changelog](CHANGELOG.md) · [The original payload](docs/PAYLOAD.md)
 
 ## Thanks
 
