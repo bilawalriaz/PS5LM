@@ -5,6 +5,26 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [0.10.0] - 2026-10-18
+
+### Added
+- **Introspection**: `POST /v1/introspect` returns the raw logits the model computed — argmax, an
+  optional top-k, an optional full-vocabulary float row, entropy — for the prompt positions and the
+  generated tokens you name, together with the **per-layer activations** copied out of the compute
+  graph (`l_out`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`, `inp_embd`, `result_norm`) for the
+  layers you name. The same `introspect` field works on `/completion`. See
+  [docs/INTROSPECTION.md](docs/INTROSPECTION.md) and `scripts/ps5lm-introspect.py`.
+- **Interventions** in the same request: zero, scale or add a value to one channel (a single FFN
+  neuron, an attention-head dimension) or a range, at every position or at one named position. The
+  answer reports how many elements each intervention changed, and the prompt cache is dropped after a
+  pass that was intervened.
+- `LLAMA_INTROSPECT` and `LLAMA_INTROSPECT_MAX_BYTES` in `/data/PS5LM/env.txt`: the endpoint is on by
+  default and one request may return at most 256 MiB of activations.
+
+### Changed
+- The request feed on Home ignores introspection requests: their answers are raw numbers, and one of
+  them can be hundreds of megabytes, which the feed would only parse to show nothing.
+
 ## [Unreleased]
 
 ### Added

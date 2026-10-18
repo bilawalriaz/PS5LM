@@ -89,8 +89,27 @@ decision metadata loads the same way, and the app labels it a decision model.
 
 ## Opened up: logits, activations, interventions
 
-The app serves chat; it does not hand out the model's insides. `llama-inspect`, a second tool built
-from the same llama.cpp, does: it runs one model on one context and one request at a time, so a
+This fork opens the model up two ways: **in the app**, where the GPU and the model you loaded are
+(`POST /v1/introspect`), and **beside it**, as a second tool with its own context (`llama-inspect`).
+
+In the app, the endpoint returns the raw logits the model computed — argmax, top-k with
+probabilities, the whole vocabulary row, entropy — for the prompt positions and generated tokens you
+name, the per-layer activations copied out of the compute graph (`l_out`, `ffn_out`, `attn_out`,
+`attn_norm`, `ffn_norm`, `inp_embd`, `result_norm`), and in-place interventions (zero, scale, add a
+channel — one neuron or head — at one position or all of them). The request also takes `messages`, so
+the probed prompt is the one the model would really be asked, and the answer says how many elements
+each intervention changed.
+
+```sh
+python3 scripts/ps5lm-introspect.py --host <console> --prompt "Once upon a time" \
+    --positions last --top-k 10 --tensors l_out --layers 12 --save run1.npz \
+    --intervention '{"tensor":"ffn_out","layers":[12],"channels":[3456],"op":"zero"}'
+```
+
+Reference and costs: [docs/INTROSPECTION.md](docs/INTROSPECTION.md), patch
+[0009](patches/0009-introspection-logits-and-activations.patch).
+
+`llama-inspect` is the standalone tool: one model on one context and one request at a time, so a
 capture is always the whole batch and a tensor's second dimension is always the token index.
 
 - **Logits.** The full next-token vector at any position, not just the sampled token's probability —

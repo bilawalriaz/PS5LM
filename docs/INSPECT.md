@@ -20,6 +20,14 @@ That makes every capture unambiguous:
 
 This is the tool for "which neurons make it say that", not for serving users.
 
+Its counterpart inside the app is `POST /v1/introspect` (patch 0009): the same
+logits, activations and channel interventions, but in the running server, on the
+GPU, with the model the app has loaded and the prompt the app would really send —
+so a model too big for a payload is still available to an experiment. See
+[docs/INTROSPECTION.md](INTROSPECTION.md). Use it when the model must be large or
+kept loaded; use `llama-inspect` when one context per request, `baseline: true` and
+per-token summaries matter more.
+
 ## Build
 
 On a workstation:
