@@ -155,6 +155,10 @@ makes a per-position capture of those tensors possible at all.
   every tensor over a long prompt can be very large; the server stops adding
   them after `LLAMA_INTROSPECT_MAX_BYTES` (default 256 MiB) and sets
   `"truncated": true`.
+- Introspection sweeps send many short requests, and each one logs a few lines. The log writer on
+  the console is slow, so `patches/0009-log-never-blocks.patch` drops log lines rather than let a
+  full log queue stop the server; `LLAMA_ARG_LOG_VERBOSITY=2` in `env.txt` keeps the log itself
+  readable during a sweep.
 - The request occupies the server's slot like any generation, and
   `positions: "all"` disables prompt caching for that request.
 

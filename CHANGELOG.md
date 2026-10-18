@@ -20,6 +20,17 @@ v0.1.x are the upstream payload releases by cobanov.
   compute graph with the eval callback that llama.cpp already has, so no work is repeated and no
   request pays for it unless it asks.
 
+### Fixed
+- Logging no longer stalls the server. llama.cpp's log queue holds 512 lines, and when it was full
+  `common_log_add()` waited for the writer thread, which in the app prints every line to `app.log`
+  and to `llama.log` with a flush each. A rapid introspection sweep (~180 lines a second) outran it
+  and the server thread froze between two log calls: `/slots` and `/metrics` hung while `/health`
+  stayed 200, until the app was restarted. On the console a full queue now drops the line and counts
+  it, and the writer logs `N log lines dropped, the log writer fell behind` once there is room
+  (`patches/0009-log-never-blocks.patch`, `__PROSPERO__` only). Measured on the console with
+  MiniCPM5-2B Q8_0: 3,000 uncached `/v1/introspect` ablations back to back all answered (p50 48 ms,
+  p99 79 ms) where about 300 used to freeze it.
+
 ## [0.9.0] - 2026-10-16
 
 ### Added
