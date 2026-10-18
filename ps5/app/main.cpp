@@ -263,6 +263,15 @@ struct UiFrameLog {
 
     void frame(int64_t total_us, int64_t pad, int64_t snap, int64_t dash, int64_t draw, int64_t swap, int64_t work,
                int presses_now) {
+        // the periodic tasks were timed inside the dash phase; report them apart
+        int64_t tasks = 0;
+        for (const int64_t v : task_us) {
+            tasks += v;
+        }
+        if (dash < tasks) {
+            tasks = dash;
+        }
+
         frames += 1;
         samples += samples_frame;
         full_batches += full_frame;
@@ -282,14 +291,6 @@ struct UiFrameLog {
                              swap / 1000.0, work / 1000.0, worst_us / 1000.0, worst);
                 std::fflush(f);
             }
-        }
-        // the periodic tasks were timed inside the dash phase; report them apart
-        int64_t tasks = 0;
-        for (const int64_t v : task_us) {
-            tasks += v;
-        }
-        if (dash < tasks) {
-            tasks = dash;
         }
         if (frames % 60 != 0) {
             return;
@@ -674,6 +675,11 @@ int main(int, char **) {
     // One device-local heap over the whole pool (RADV splits an APU's 2/3 to
     // 1/3), and a HOME for llama.cpp, which throws without one.
     setenv("radv_enable_unified_heap_on_apu", "true", 1);
+    // The introspection API is off unless the setting asks for it (or env.txt
+    // sets LLAMA_INTROSPECT for a build without the row).
+    if (models.settings.introspect) {
+        setenv("LLAMA_INTROSPECT", "1", 1);
+    }
     setenv("HOME", "/data/PS5LM", 0);
     setenv("LLAMA_CACHE", "/data/PS5LM/cache", 0);
     // Driver and backend switches to measure with, one NAME=value a line in

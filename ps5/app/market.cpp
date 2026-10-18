@@ -368,12 +368,15 @@ void Market::remove(int i) {
         return;
     }
     Download & d = view_.downloads[(size_t) i];
-    if (d.state == DownloadState::running || d.state == DownloadState::retrying) {
-        stop_ = 2;  // the worker deletes the partial file and the entry
-        return;
-    }
+    const bool live = d.state == DownloadState::running || d.state == DownloadState::retrying;
+    // Delete the row and the partial file here, so the answer to "cancel" is
+    // immediate. The worker may still be inside a read: it stops at its next
+    // one, writes into the unlinked file meanwhile, and finds no row to update.
     if (d.state != DownloadState::done) {
         unlink(part_path(d).c_str());
+    }
+    if (live) {
+        stop_ = 2;
     }
     view_.downloads.erase(view_.downloads.begin() + i);
     save_queue();
@@ -515,11 +518,14 @@ bool Market::fetch(Download & d) {
             std::printf("ps5lm-app: download %s: piece at %llu stopped after %llu bytes: %s\n", d.file.c_str(),
                         (unsigned long long) off, (unsigned long long) got, text);
             // A 4xx other than 408/429 will not get better by asking again.
-            if ((r.status >= 400 && r.status < 500 && r.status != 408 && r.status != 429) || r.status == 200 || f > 20) {
+            // Eight failures in a row is about two minutes of trying: enough for
+            // a dropped connection to come back, short enough that a stuck
+            // download says so instead of retrying for half an hour.
+            if ((r.status >= 400 && r.status < 500 && r.status != 408 && r.status != 429) || r.status == 200 || f > 8) {
                 fatal = true;
                 return;
             }
-            const int wait = std::min(60, 2 << std::min(f, 5));  // 4, 8, 16, 32, 60 s
+            const int wait = std::min(15, 2 << std::min(f, 4));  // 4, 8, 15 s
             ++waiting;
             m.unlock();
             for (int s = 0; s < wait * 4 && stop_ == 0; ++s) {
