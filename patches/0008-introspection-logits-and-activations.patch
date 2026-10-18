@@ -68,7 +68,7 @@ index 60c5633..8d21298 100644
      int n_empty_consecutive = 0;
  
      std::unique_ptr<server_prompt_cache> prompt_cache;
-@@ -1213,11 +1238,31 @@ private:
+@@ -1213,11 +1238,33 @@ private:
              params_base.load_progress_callback_user_data = &load_progress_text;
          }
  
