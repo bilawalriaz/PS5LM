@@ -115,6 +115,13 @@ Other architectures name their tensors in `src/models/<arch>.cpp`; a name that
 does not exist is simply not captured, and the answer then has no activations
 for it.
 
+One upstream detail the endpoint hides for you: llama.cpp computes the *last*
+layer's output, and `result_norm`/`result_output`, only for the rows that asked
+for logits, so those tensors do not exist for earlier rows of a normally batched
+prompt. A request that names positions (or intervenes at one) therefore marks
+every prompt row as an output row and renders one token at a time, which is what
+makes a per-position capture of those tensors possible at all.
+
 ## Costs and limits
 
 - **`positions: "all"` evaluates the prompt one token at a time** so that every

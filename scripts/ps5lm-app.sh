@@ -50,13 +50,25 @@ deploy() {
 }
 
 launch() {
-    # The protocol's script builds the payload; it is sent with socat, as the
-    # other scripts here do (the script's own sender needs GNU nc's -q).
-    local tmp=${TMPDIR:-/tmp}
-    PS5_PAYLOAD_SDK=${PS5_PAYLOAD_SDK:-$root/.deps/ps5-payload-sdk} PS5_CONTROLLER_COMPILE_ONLY=1 \
-        bash "$protocol/scripts/send-controller.sh" launch "$title" "$host" "${PS5_PORT:-9021}" > /dev/null
-    socat -u "FILE:$tmp/ps5-homebrew-protocol/launch-$title.elf" "TCP:$host:${PS5_PORT:-9021}"
-    echo "ps5lm-app: launch sent"
+    if [ -d "$protocol" ]; then
+        # The protocol's script builds the payload; it is sent with socat, as the
+        # other scripts here do (the script's own sender needs GNU nc's -q).
+        local tmp=${TMPDIR:-/tmp}
+        PS5_PAYLOAD_SDK=${PS5_PAYLOAD_SDK:-$root/.deps/ps5-payload-sdk} PS5_CONTROLLER_COMPILE_ONLY=1 \
+            bash "$protocol/scripts/send-controller.sh" launch "$title" "$host" "${PS5_PORT:-9021}" > /dev/null
+        socat -u "FILE:$tmp/ps5-homebrew-protocol/launch-$title.elf" "TCP:$host:${PS5_PORT:-9021}"
+        echo "ps5lm-app: launch sent"
+        return
+    fi
+
+    # ps5-homebrew-dev-protocol is not public any more: build/launch/launch.elf
+    # does the same job, reading the title id and the folder to register from
+    # /data/PS5LM/launch.txt, which is written here first.
+    [ -f "$root/build/launch/launch.elf" ] || bash "$root/scripts/build-launch.sh"
+    printf '%s\n%s\n' "$title" "/data/homebrew/$title" | curl -sS -T - "$ftp/data/PS5LM/launch.txt"
+    sleep 1
+    socat -u "FILE:$root/build/launch/launch.elf" "TCP:$host:${PS5_PORT:-9021}"
+    echo "ps5lm-app: launch sent (build/launch/launch.elf)"
 }
 
 # Requests the running app takes once a second.

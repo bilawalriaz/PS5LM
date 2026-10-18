@@ -24,6 +24,9 @@ v0.1.x are the upstream payload releases by cobanov.
 ### Changed
 - The request feed on Home ignores introspection requests: their answers are raw numbers, and one of
   them can be hundreds of megabytes, which the feed would only parse to show nothing.
+- A request that names positions (or intervenes at one) now marks every prompt row as an output row.
+  llama.cpp computes the last layer's output and `result_norm` only for rows that asked for logits,
+  so without this a per-position capture of `l_out-<last>` and `result_norm` was empty.
 
 ## [Unreleased]
 

@@ -12,7 +12,7 @@ index 70b8d7d..7da0f33 100644
  
  if (BUILD_SHARED_LIBS)
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 60c5633..9517f6e 100644
+index 60c5633..8d21298 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -292,6 +292,13 @@ struct server_slot {
@@ -176,16 +176,17 @@ index 60c5633..9517f6e 100644
  #ifdef DEBUG_TIMINGS
                  llama_synchronize(ctx_tgt);
  #endif
-@@ -3978,13 +4068,20 @@ private:
+@@ -3978,13 +4068,21 @@ private:
                              break;
                          }
  
 +                        // PS5LM fork: an introspection request may want the logits and
-+                        // activations of every prompt position, which needs the output
-+                        // flag on each row (the context keeps one logits row per flag)
++                        // activations of every prompt position, and llama.cpp computes the
++                        // last layer's output only for rows that ask for it - so a
++                        // position-specific intervention needs the flag on every row too
 +                        const bool introspect_all =
 +                            slot.task->params.introspect.enabled &&
-+                            slot.task->params.introspect.all_positions;
++                            slot.task->params.introspect.step_tokens() > 0;
 +
                          // embedding requires all tokens in the batch to be output;
                          // MTP also wants logits at every prompt position so the
@@ -198,7 +199,7 @@ index 60c5633..9517f6e 100644
                              /* is_prompt = */ true);
                          if (!slot.task->decision.order.empty()) {
                              batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
-@@ -4286,6 +4383,159 @@ private:
+@@ -4286,6 +4384,159 @@ private:
          return true;
      }
  
@@ -358,7 +359,7 @@ index 60c5633..9517f6e 100644
      void post_decode(int32_t n_batch_tokens, int32_t off) {
          // for checking if a given batch index is inside the current sub-batch
          auto is_inside_view = [&](int32_t idx) {
-@@ -4842,6 +5092,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -4842,6 +5093,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
              task.apply_chat_session(chat_session);
  
@@ -394,7 +395,7 @@ index 60c5633..9517f6e 100644
              task.id_slot = json_value(data, "id_slot", -1);
              sse_ping_interval = task.params.sse_ping_interval;
  
-@@ -5690,6 +5969,49 @@ void server_routes::init_routes() {
+@@ -5690,6 +5970,49 @@ void server_routes::init_routes() {
          return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
      };
  
@@ -459,10 +460,10 @@ index ed23f7d..d2ae01d 100644
  
 diff --git a/tools/server/server-introspect.cpp b/tools/server/server-introspect.cpp
 new file mode 100644
-index 0000000..ff119cf
+index 0000000..f88148f
 --- /dev/null
 +++ b/tools/server/server-introspect.cpp
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,622 @@
 +#include "server-introspect.h"
 +
 +#include "common.h"
@@ -867,7 +868,6 @@ index 0000000..ff119cf
 +    const int64_t ne0 = t->ne[0];
 +    const int64_t ne1 = t->ne[1];
 +    const int64_t ne2 = t->ne[2];
-+    const size_t elem = ggml_type_size(t->type);
 +    const bool direct = host && t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->nb[1] == (size_t) ne0 * sizeof(float);
 +    if (!direct && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
 +        return true; // not a float activation
@@ -882,9 +882,9 @@ index 0000000..ff119cf
 +
 +    // a layout with unit strides in dim 0/1 (how llama.cpp's graph tensors are laid out)
 +    std::vector<float> v;
-+    const float * dense = nullptr;
++    float * dense = nullptr; // mutable pointer into raw when the layout is already unit-stride
 +    if (direct) {
-+        dense = (const float *) raw.data();
++        dense = reinterpret_cast<float *>(raw.data());
 +    } else {
 +        v.resize((size_t) ne0 * ne1 * ne2);
 +        if (t->type == GGML_TYPE_F32) {
@@ -894,6 +894,7 @@ index 0000000..ff119cf
 +        } else {
 +            ggml_bf16_to_fp32_row((const ggml_bf16_t *) raw.data(), v.data(), (int64_t) ne0 * ne1 * ne2);
 +        }
++        dense = v.data();
 +    }
 +
 +    bool changed = false;
@@ -919,12 +920,7 @@ index 0000000..ff119cf
 +                    continue;
 +                }
 +                const size_t idx = (size_t) i0 + (size_t) i1 * ne0;
-+                float * slot_v = nullptr;
-+                if (dense != nullptr) {
-+                    slot_v = (float *) dense + idx;
-+                } else {
-+                    slot_v = v.data() + idx;
-+                }
++                float * slot_v = dense + idx;
 +                if (iv->op == "zero") {
 +                    *slot_v = 0.0f;
 +                } else if (iv->op == "scale") {
