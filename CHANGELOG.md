@@ -5,6 +5,17 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [0.10.1] - 2026-10-18
+
+### Fixed
+- `argmax.prob` is the argmax's real probability. It was hardcoded to `1.0`, so an answer that did not
+  ask for the full row reported a certainty the model did not have. The console run exposed it (an
+  entropy of 1.176 nats printed next to `p=1.0000`); the value is now `exp(-logsumexp)` and matches
+  `softmax()` of the full vocabulary row to 1e-9. The top-k probabilities were always correct.
+- `docs/INTROSPECTION.md` says which activation tensors this revision's backends actually deliver:
+  `attn_norm`, `attn_out`, `ffn_norm`, `ffn_out`, `l_out`, `result_norm` and `result_output` come
+  back; `inp_embd` does not (the graph names that node, the scheduler does not offer it here).
+
 ## [0.10.0] - 2026-10-18
 
 ### Added
@@ -29,11 +40,6 @@ v0.1.x are the upstream payload releases by cobanov.
   intervention that changed 20,480 elements and moved the argmax with a top-10 KL of 0.915 nats. The
   same token's tensors are byte-identical between batched and step-by-step capture. `docs/CONSOLE.md`
   has the table.
-
-### Fixed
-- `argmax.prob` is the argmax's real probability. It was hardcoded to `1.0`, so an answer that did
-  not ask for the full row reported a certainty the model did not have (the entropy and the top-k
-  probabilities were correct, which is how the console run exposed it).
 
 ### Changed
 - The request feed on Home ignores introspection requests: their answers are raw numbers, and one of
