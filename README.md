@@ -87,6 +87,32 @@ curl http://<console>:8081/v1/systemone -H 'Content-Type: application/json' -d '
 The Suggested list has d1 Omni 600M, d1 3B and Clef Flash. Any GGUF that carries llama.cpp's
 decision metadata loads the same way, and the app labels it a decision model.
 
+## Opened up: logits, activations, interventions
+
+The app serves chat; it does not hand out the model's insides. `llama-inspect`, a second tool built
+from the same llama.cpp, does: it runs one model on one context and one request at a time, so a
+capture is always the whole batch and a tensor's second dimension is always the token index.
+
+- **Logits.** The full next-token vector at any position, not just the sampled token's probability —
+  top-k with probabilities, or the whole distribution as raw `float32`.
+- **Activations.** Any graph tensor by name: `ffn_gate-20`, `kqv_out-12`, `inp_embd`. Summary
+  statistics per token (mean, std, min, max, L2, loudest features) or the raw values.
+- **Interventions.** Zero, scale or shift a channel in place — one FFN neuron, one attention head —
+  and read what the model answers next. `baseline: true` runs the prompt both ways in one call so
+  the difference is the intervention, not the sampling.
+
+```sh
+scripts/build-llama.sh llama-inspect
+scripts/run.sh llama-inspect -m /data/PS5LM/models/model.gguf -c 2048 --host 0.0.0.0 --port 8090
+
+python3 scripts/ps5lm_inspect.py --host <console> forward --prompt "The capital of France is" --top-k 5
+python3 examples/interpret/neuron_probe.py --host <console> --layer 20 \
+    --prompt-a "The capital of France is" --prompt-b "The capital of Germany is" --target " Paris"
+```
+
+The tool is CPU-only in this build (the app keeps the GPU) and unauthenticated, so it listens on
+loopback unless told otherwise. Endpoints, tensor names and limits: [docs/INSPECT.md](docs/INSPECT.md).
+
 ## Try it
 
 You need a PS5 on firmware 7.00 to 13.60, jailbroken, with these payloads loaded:

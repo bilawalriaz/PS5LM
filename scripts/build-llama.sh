@@ -12,7 +12,7 @@ source "$root/scripts/env.sh"
 llama="$root/third_party/llama.cpp"
 out="$root/build/llama-ps5"
 mbedtls="$root/.deps/mbedtls-ps5"
-targets=("${@:-ps5lm llama-cli llama-server llama-bench llama-completion}")
+targets=("${@:-ps5lm llama-cli llama-server llama-inspect llama-bench llama-completion}")
 
 if [ ! -f "$llama/CMakeLists.txt" ]; then
     echo "build-llama: run git submodule update --init first" >&2

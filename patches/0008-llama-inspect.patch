@@ -1,0 +1,1186 @@
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index c8ad1db..62888ab 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -26,6 +26,7 @@ else()
+         add_subdirectory(cli)
+         add_subdirectory(server)
+     endif()
++    add_subdirectory(inspect)
+     add_subdirectory(tokenize)
+     add_subdirectory(tts)
+     add_subdirectory(mtmd)
+diff --git a/tools/inspect/CMakeLists.txt b/tools/inspect/CMakeLists.txt
+new file mode 100644
+index 0000000..f01f3d7
+--- /dev/null
++++ b/tools/inspect/CMakeLists.txt
+@@ -0,0 +1,14 @@
++# llama-inspect: logits, activations and interventions over HTTP
++#
++# Built with the rest of llama.cpp's tools. On the PS5 it is a payload built by
++# scripts/build-llama.sh; on a workstation it is a normal cmake target.
++
++set(TARGET llama-inspect)
++
++add_executable(${TARGET} main.cpp inspect.cpp)
++
++install(TARGETS ${TARGET} RUNTIME)
++
++target_link_libraries(${TARGET} PRIVATE llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
++target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/inspect/inspect.cpp b/tools/inspect/inspect.cpp
+new file mode 100644
+index 0000000..c779599
+--- /dev/null
++++ b/tools/inspect/inspect.cpp
+@@ -0,0 +1,1111 @@
++// llama-inspect: llama.cpp's inference, opened up.
++//
++// The server exposes what a chat client needs: text, top-n logprobs, timings.
++// This tool exposes what an interpretability experiment needs: the full logit
++// vector at any position, the intermediate tensors of the graph (FFN
++// activations, attention outputs, the embedding), and the ability to change
++// those tensors in place and see what the model does next.
++//
++// It runs its own llama_context, one request at a time, so a capture is always
++// the whole batch and a tensor's second dimension is always the token index.
++// The server cannot offer that: its scheduler interleaves slots.
++//
++// SPDX-License-Identifier: MIT
++
++#include "inspect.h"
++
++#include "arg.h"
++#include "build-info.h"
++#include "common.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++#include "llama.h"
++
++#include <cpp-httplib/httplib.h>
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <functional>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <random>
++#include <regex>
++#include <stdexcept>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++using json = nlohmann::json;
++
++namespace {
++
++// ---------------------------------------------------------------------------
++// small helpers
++// ---------------------------------------------------------------------------
++
++std::string b64(const void * data, size_t len) {
++    static const char * tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    const uint8_t * p = (const uint8_t *) data;
++    std::string out;
++    out.reserve(((len + 2) / 3) * 4);
++    for (size_t i = 0; i < len; i += 3) {
++        const uint32_t a = p[i];
++        const uint32_t b = i + 1 < len ? p[i + 1] : 0;
++        const uint32_t c = i + 2 < len ? p[i + 2] : 0;
++        const uint32_t v = (a << 16) | (b << 8) | c;
++        out.push_back(tbl[(v >> 18) & 63]);
++        out.push_back(tbl[(v >> 12) & 63]);
++        out.push_back(i + 1 < len ? tbl[(v >> 6) & 63] : '=');
++        out.push_back(i + 2 < len ? tbl[v & 63] : '=');
++    }
++    return out;
++}
++
++int64_t now_ms() {
++    using namespace std::chrono;
++    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
++}
++
++struct intervention {
++    std::string tensor;
++    std::vector<int64_t> channels;
++    int64_t channel_start = -1;
++    int64_t channel_end   = -1;
++    int64_t position      = -1;  // token index; -1 = every token
++    std::string op        = "zero";
++    float value           = 0.0f;
++    bool matched          = false;
++    int64_t modified      = 0;
++};
++
++struct capture_spec {
++    std::vector<std::string> tensors;
++    std::string mode = "summary";   // summary | raw | names
++    int top_k = 8;
++    std::vector<int64_t> positions; // global token indices; empty = every token
++    int64_t max_raw_bytes = 64LL << 20;
++};
++
++struct token_stat {
++    int64_t index = 0;
++    int64_t count = 0;
++    double sum = 0, sq = 0, min = 0, max = 0;
++    double mean = 0, std = 0;
++    std::vector<std::pair<float, int64_t>> top; // value, feature index
++    bool seen = false;
++};
++
++struct captured_tensor {
++    std::string name;
++    std::string type;
++    int64_t ne[4] = {1, 1, 1, 1};
++    int token_axis = 1;
++    bool raw = false;
++    bool truncated = false;
++    std::vector<token_stat> tokens;
++    std::vector<float> data;
++};
++
++struct capture_state {
++    std::vector<std::regex> filters;
++    std::vector<std::pair<std::regex, size_t>> iv_filters;
++    std::vector<intervention> * iv = nullptr;
++    std::string mode;
++    int top_k = 0;
++    std::vector<int64_t> positions;
++    int64_t max_raw_bytes = 0;
++    int64_t offset = 0;
++    int64_t n_tokens = 0;
++    std::map<std::string, captured_tensor> out;
++    std::vector<std::string> order;
++
++    bool wants(const char * name) const {
++        if (mode == "names") return true;
++        for (const auto & re : filters) {
++            if (std::regex_search(name, re)) return true;
++        }
++        for (const auto & re : iv_filters) {
++            if (std::regex_search(name, re.first)) return true;
++        }
++        return false;
++    }
++
++    bool captures(const char * name) const {
++        if (mode == "names") return true;
++        for (const auto & re : filters) {
++            if (std::regex_search(name, re)) return true;
++        }
++        return false;
++    }
++
++    void collect(ggml_tensor * t);
++};
++
++void prepare_iv(capture_state & cs, std::vector<intervention> & iv) {
++    cs.iv = &iv;
++    cs.iv_filters.reserve(iv.size());
++    for (size_t k = 0; k < iv.size(); ++k) {
++        cs.iv_filters.emplace_back(std::regex(iv[k].tensor, std::regex::optimize), k);
++    }
++}
++
++// Global pointer read by the scheduler callback. Decoding is synchronous on
++// the request's thread and requests are serialised, so at most one state is
++// live; the atomic is for the callback contract, not for concurrency.
++std::atomic<capture_state *> g_capture{nullptr};
++
++bool tensor_to_f32(const ggml_tensor * t, std::vector<float> & out) {
++    if (t->data == nullptr) return false;
++    const int64_t n = ggml_nelements(t);
++    if (n <= 0) return false;
++    out.resize((size_t) n);
++
++    const bool host = t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
++    std::vector<uint8_t> tmp;
++    const void * src = t->data;
++    if (!host) {
++        tmp.resize(ggml_nbytes(t));
++        ggml_backend_tensor_get(t, tmp.data(), 0, ggml_nbytes(t));
++        src = tmp.data();
++    }
++
++    switch (t->type) {
++        case GGML_TYPE_F32:
++            std::memcpy(out.data(), src, (size_t) n * sizeof(float));
++            break;
++        case GGML_TYPE_F16: {
++            const ggml_fp16_t * p = (const ggml_fp16_t *) src;
++            for (int64_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(p[i]);
++            break;
++        }
++        case GGML_TYPE_BF16: {
++            const ggml_bf16_t * p = (const ggml_bf16_t *) src;
++            for (int64_t i = 0; i < n; ++i) out[i] = ggml_bf16_to_fp32(p[i]);
++            break;
++        }
++        default:
++            return false;
++    }
++    return true;
++}
++
++bool tensor_from_f32(ggml_tensor * t, const std::vector<float> & v) {
++    const int64_t n = ggml_nelements(t);
++    if (n <= 0 || (int64_t) v.size() != n) return false;
++
++    const bool host = t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
++    std::vector<uint8_t> buf;
++    void * dst = t->data;
++    if (!host) {
++        buf.resize(ggml_nbytes(t));
++        dst = buf.data();
++    }
++
++    switch (t->type) {
++        case GGML_TYPE_F32:
++            std::memcpy(dst, v.data(), (size_t) n * sizeof(float));
++            break;
++        case GGML_TYPE_F16: {
++            ggml_fp16_t * p = (ggml_fp16_t *) dst;
++            for (int64_t i = 0; i < n; ++i) p[i] = ggml_fp32_to_fp16(v[i]);
++            break;
++        }
++        case GGML_TYPE_BF16: {
++            ggml_bf16_t * p = (ggml_bf16_t *) dst;
++            for (int64_t i = 0; i < n; ++i) p[i] = ggml_fp32_to_bf16(v[i]);
++            break;
++        }
++        default:
++            return false;
++    }
++    if (!host) ggml_backend_tensor_set(t, dst, 0, ggml_nbytes(t));
++    return true;
++}
++
++bool eval_cb(ggml_tensor * t, bool ask, void * user_data) {
++    (void) user_data;
++    capture_state * c = g_capture.load(std::memory_order_acquire);
++    if (c == nullptr) return false;
++    if (ask) return c->wants(t->name);
++    c->collect(t);
++    return true;
++}
++
++void capture_state::collect(ggml_tensor * t) {
++    const bool do_capture = captures(t->name);
++    const bool do_iv      = iv != nullptr && !iv->empty();
++
++    // The tensor's own shape decides where the token axis is. Activations are
++    // [features, tokens] (or [head_dim, heads, tokens]); a bare vector has one
++    // token and no token axis in practice.
++    int axis = -1;
++    if (t->ne[1] == n_tokens && t->ne[3] == 1) axis = 1;
++    else if (t->ne[2] == n_tokens && t->ne[3] == 1) axis = 2;
++    else if (t->ne[1] == 1 && t->ne[2] == 1) axis = 1;
++    else axis = (t->ne[2] == n_tokens) ? 2 : 1;
++
++    const bool need_values = do_iv || (do_capture && mode != "names");
++    std::vector<float> v;
++    if (need_values && !tensor_to_f32(t, v)) {
++        // Quantised tensors (weights) have no float activations to read.
++        if (do_capture) {
++            captured_tensor ct;
++            ct.name       = t->name;
++            ct.type       = ggml_type_name(t->type);
++            ct.token_axis = axis;
++            for (int i = 0; i < 4; ++i) ct.ne[i] = t->ne[i];
++            ct.truncated  = true;
++            out[t->name]  = std::move(ct);
++            order.push_back(t->name);
++        }
++        return;
++    }
++
++    if (do_iv) {
++        const int64_t ne0 = t->ne[0], ne1 = t->ne[1], ne2 = t->ne[2];
++        const int64_t stride_tok = ne0;
++        for (size_t k = 0; k < iv->size(); ++k) {
++            intervention & iv1 = (*iv)[k];
++            if (!std::regex_search(t->name, iv_filters[k].first)) continue;
++            iv1.matched = true;
++            for (int64_t i = 0; i < (int64_t) v.size(); ++i) {
++                const int64_t i0 = i % ne0;
++                const int64_t i1 = (i / stride_tok) % ne1;
++                const int64_t i2 = (i / (stride_tok * ne1)) % ne2;
++                const int64_t tok = (axis == 2) ? i2 : i1;
++                if (iv1.position >= 0 && iv1.position != tok) continue;
++
++                const int64_t ch = (axis == 2) ? (i0 + i1 * ne0) : i0;
++                bool hit = false;
++                if (!iv1.channels.empty()) {
++                    hit = std::find(iv1.channels.begin(), iv1.channels.end(), ch) != iv1.channels.end();
++                } else if (iv1.channel_start >= 0) {
++                    hit = ch >= iv1.channel_start && (iv1.channel_end < 0 || ch < iv1.channel_end);
++                } else {
++                    hit = true;
++                }
++                if (!hit) continue;
++
++                if (iv1.op == "zero") {
++                    v[i] = 0.0f;
++                } else if (iv1.op == "scale") {
++                    v[i] *= iv1.value;
++                } else if (iv1.op == "add") {
++                    v[i] += iv1.value;
++                } else {
++                    throw std::invalid_argument("unknown intervention op: " + iv1.op);
++                }
++                iv1.modified++;
++            }
++        }
++        if (std::any_of(iv->begin(), iv->end(), [](const intervention & x) { return x.modified > 0; })) {
++            tensor_from_f32(t, v);
++        }
++    }
++
++    if (!do_capture) return;
++
++    captured_tensor ct;
++    ct.name       = t->name;
++    ct.type       = ggml_type_name(t->type);
++    ct.token_axis = axis;
++    for (int i = 0; i < 4; ++i) ct.ne[i] = t->ne[i];
++
++    if (mode == "names") {
++        out[t->name] = std::move(ct);
++        order.push_back(t->name);
++        return;
++    }
++
++    if (mode == "raw") {
++        const int64_t bytes = ggml_nelements(t) * (int64_t) sizeof(float);
++        if (bytes > max_raw_bytes) {
++            ct.truncated = true;
++        } else {
++            ct.raw  = true;
++            ct.data = v;
++        }
++        out[t->name] = std::move(ct);
++        order.push_back(t->name);
++        return;
++    }
++
++    const int64_t ne0 = t->ne[0], ne1 = t->ne[1], ne2 = t->ne[2];
++    const int64_t n_tok = (axis == 2) ? ne2 : ne1;
++    ct.tokens.assign((size_t) std::max<int64_t>(n_tok, 0), token_stat{});
++
++    const std::unordered_set<int64_t> want(positions.begin(), positions.end());
++
++    for (int64_t i = 0; i < (int64_t) v.size(); ++i) {
++        const int64_t i0 = i % ne0;
++        const int64_t i1 = (i / ne0) % ne1;
++        const int64_t i2 = (i / (ne0 * ne1)) % ne2;
++        const int64_t tok = (axis == 2) ? i2 : i1;
++        if (!want.empty() && want.find(offset + tok) == want.end()) continue;
++        if (tok < 0 || tok >= n_tok) continue;
++
++        token_stat & s = ct.tokens[(size_t) tok];
++        if (!s.seen) {
++            s.seen  = true;
++            s.index = offset + tok;
++            s.min   = v[i];
++            s.max   = v[i];
++        }
++        const double x = v[i];
++        s.count++;
++        s.sum += x;
++        s.sq  += x * x;
++        s.min  = std::min(s.min, x);
++        s.max  = std::max(s.max, x);
++
++        if (top_k > 0) {
++            const int64_t feature = (axis == 2) ? (i0 + i1 * ne0) : i0;
++            s.top.emplace_back(v[i], feature);
++            if ((int) s.top.size() > top_k) {
++                auto worst = std::min_element(s.top.begin(), s.top.end(),
++                        [](const std::pair<float, int64_t> & a, const std::pair<float, int64_t> & b) {
++                            return std::fabs(a.first) < std::fabs(b.first);
++                        });
++                s.top.erase(worst);
++            }
++        }
++    }
++
++    for (auto & s : ct.tokens) {
++        if (!s.seen) {
++            s.index = offset;
++            continue;
++        }
++        const double n = (double) s.count;
++        const double mean = s.sum / n;
++        s.mean = mean;
++        s.std  = std::sqrt(std::max(0.0, s.sq / n - mean * mean));
++        // norm and mean live here; the JSON writer turns them into numbers.
++        s.sq   = std::sqrt(s.sq); // reuse the field for the L2 norm
++        if (top_k > 0) {
++            std::sort(s.top.begin(), s.top.end(), [](const auto & a, const auto & b) {
++                return std::fabs(a.first) > std::fabs(b.first);
++            });
++        }
++    }
++
++    out[t->name] = std::move(ct);
++    order.push_back(t->name);
++}
++
++// ---------------------------------------------------------------------------
++// JSON shaping
++// ---------------------------------------------------------------------------
++
++json stat_to_json(const token_stat & s) {
++    if (!s.seen) return json::object();
++    json j;
++    j["index"] = s.index;
++    j["mean"]  = s.mean;
++    j["std"]   = s.std;
++    j["min"]   = s.min;
++    j["max"]   = s.max;
++    j["l2"]    = s.sq; // the L2 norm, parked in sq above
++    return j;
++}
++
++json captures_to_json(const capture_state & cs) {
++    json arr = json::array();
++    for (const auto & name : cs.order) {
++        const captured_tensor & ct = cs.out.at(name);
++        json j;
++        j["name"]       = ct.name;
++        j["type"]       = ct.type;
++        j["ne"]         = json::array({ct.ne[0], ct.ne[1], ct.ne[2], ct.ne[3]});
++        j["token_axis"] = ct.token_axis;
++        if (ct.truncated) j["truncated"] = true;
++        if (ct.raw) {
++            j["encoding"] = "f32le-base64";
++            j["data"]     = b64(ct.data.data(), ct.data.size() * sizeof(float));
++        } else if (!ct.tokens.empty()) {
++            json toks = json::array();
++            for (const auto & s : ct.tokens) {
++                if (!s.seen) continue;
++                json t = stat_to_json(s);
++                if (!s.top.empty()) {
++                    json top = json::array();
++                    for (const auto & p : s.top) {
++                        top.push_back({{"index", p.second}, {"value", p.first}});
++                    }
++                    t["top"] = std::move(top);
++                }
++                toks.push_back(std::move(t));
++            }
++            j["tokens"] = std::move(toks);
++        }
++        arr.push_back(std::move(j));
++    }
++    return arr;
++}
++
++// ---------------------------------------------------------------------------
++// engine
++// ---------------------------------------------------------------------------
++
++class engine {
++public:
++    explicit engine(common_params & params) {
++        params.warmup = false;
++        params.cb_eval = eval_cb;
++        params.cb_eval_user_data = nullptr;
++
++        // A batch this size bounds the logits buffer (vocab x batch floats)
++        // and still fills the GPU on a prompt. Everything above it is chunked.
++        const int32_t cap = 128;
++        params.n_batch = std::min<int32_t>(params.n_batch, cap);
++        params.n_ubatch = std::min<int32_t>(params.n_ubatch, params.n_batch);
++        params.n_outputs_max = params.n_batch;
++        params.n_outputs_max_per_seq = params.n_batch;
++
++        path_ = params.model.path;
++        init_ = common_init_from_params(params);
++        if (!init_) throw std::runtime_error("could not load the model");
++        model_ = init_->model();
++        ctx_   = init_->context();
++        if (!model_ || !ctx_) throw std::runtime_error("model or context is null");
++        vocab_ = llama_model_get_vocab(model_);
++        n_ctx_ = llama_n_ctx(ctx_);
++        n_batch_ = (int) params.n_batch;
++    }
++
++    ~engine() = default;
++
++    const std::string & path() const { return path_; }
++    llama_context * ctx() const { return ctx_; }
++    const llama_model * model() const { return model_; }
++
++    json info() const {
++        char desc[256] = {0};
++        llama_model_desc(model_, desc, sizeof(desc));
++        json j;
++        j["model"]        = path_;
++        j["desc"]         = desc;
++        j["n_params"]     = (uint64_t) llama_model_n_params(model_);
++        j["size_bytes"]   = (uint64_t) llama_model_size(model_);
++        j["n_ctx"]        = n_ctx_;
++        j["n_ctx_train"]  = llama_model_n_ctx_train(model_);
++        j["n_batch"]      = n_batch_;
++        j["n_embd"]       = llama_model_n_embd(model_);
++        j["n_layer"]      = llama_model_n_layer(model_);
++        j["n_head"]       = llama_model_n_head(model_);
++        j["n_head_kv"]    = llama_model_n_head_kv(model_);
++        j["n_vocab"]      = llama_vocab_n_tokens(vocab_);
++        j["add_bos"]      = llama_vocab_get_add_bos(vocab_);
++        j["has_encoder"]  = llama_model_has_encoder(model_);
++        j["build"]        = llama_build_info();
++        return j;
++    }
++
++    std::vector<llama_token> tokenize(const std::string & text, bool add_special, bool parse_special) const {
++        int n = llama_tokenize(vocab_, text.data(), (int32_t) text.size(), nullptr, 0, add_special, parse_special);
++        if (n < 0) n = -n;
++        std::vector<llama_token> out((size_t) std::max(n, 0));
++        if (out.empty()) return out;
++        const int32_t m = llama_tokenize(vocab_, text.data(), (int32_t) text.size(),
++                                         out.data(), (int32_t) out.size(), add_special, parse_special);
++        if (m < 0) throw std::runtime_error("tokenisation failed");
++        out.resize((size_t) m);
++        return out;
++    }
++
++    std::string piece(llama_token id) const {
++        char buf[256];
++        int n = llama_token_to_piece(vocab_, id, buf, sizeof(buf), 0, false);
++        if (n < 0) {
++            std::vector<char> big((size_t) (-n));
++            n = llama_token_to_piece(vocab_, id, big.data(), (int32_t) big.size(), 0, false);
++            return n > 0 ? std::string(big.data(), (size_t) n) : std::string();
++        }
++        return std::string(buf, (size_t) n);
++    }
++
++    json tokens_json(const std::vector<llama_token> & toks) const {
++        json arr = json::array();
++        for (auto t : toks) arr.push_back({{"id", t}, {"piece", piece(t)}});
++        return arr;
++    }
++
++    json tokenize_request(const json & req) const {
++        const std::string text = req.value("text", "");
++        const bool add_special = req.value("add_special", true);
++        const bool parse_special = req.value("parse_special", true);
++        const auto toks = tokenize(text, add_special, parse_special);
++        return json{{"tokens", tokens_json(toks)},
++                    {"n_tokens", toks.size()},
++                    {"text", text}};
++    }
++
++    json forward(const json & req) {
++        std::lock_guard<std::mutex> lock(mu_);
++
++        const auto toks = tokens_from_request(req);
++        if (toks.empty()) throw std::invalid_argument("empty prompt");
++        if ((int64_t) toks.size() > n_ctx_) {
++            throw std::invalid_argument("prompt of " + std::to_string(toks.size()) +
++                                        " tokens exceeds the context of " + std::to_string(n_ctx_));
++        }
++
++        const capture_spec spec = spec_from_json(req.value("capture", json::object()));
++        std::vector<intervention> iv = interventions_from_json(req.value("interventions", json::array()));
++
++        const json logs = req.value("logits", json::object());
++        const std::string mode = logs.value("positions", "last");
++        const int top_k = logs.value("top_k", 20);
++        const bool raw  = logs.value("raw", false);
++        std::vector<int64_t> positions;
++        if (logs.contains("indices") && logs.at("indices").is_array()) {
++            for (auto & v : logs.at("indices")) positions.push_back(v.get<int64_t>());
++        }
++
++        const int64_t started = now_ms();
++        const bool baseline = req.value("baseline", false);
++
++        json base_out = nullptr;
++        if (baseline) {
++            capture_spec no_cap = spec;
++            no_cap.tensors.clear();
++            pass_result r = run_pass(toks, 0, no_cap, {}, mode, positions, top_k, raw);
++            base_out = result_to_json(toks, r, spec);
++        }
++
++        pass_result r = run_pass(toks, 0, spec, iv, mode, positions, top_k, raw);
++        json out = result_to_json(toks, r, spec);
++        if (baseline) out["baseline"] = base_out;
++        out["timings"] = {{"ms", now_ms() - started}};
++        return out;
++    }
++
++    json generate(const json & req) {
++        std::lock_guard<std::mutex> lock(mu_);
++
++        auto toks = tokens_from_request(req);
++        if (toks.empty()) throw std::invalid_argument("empty prompt");
++
++        const int max_tokens = req.value("max_tokens", 32);
++        const float temp     = req.value("temperature", 0.0f);
++        const int top_k      = req.value("top_k", 40);
++        const int logits_top = req.value("logits_top_k", 10);
++        const bool capture_each = req.value("capture_each", true);
++        const capture_spec spec = spec_from_json(req.value("capture", json::object()));
++        if ((int64_t) toks.size() + max_tokens > n_ctx_) {
++            throw std::invalid_argument("prompt + max_tokens exceeds the context of " + std::to_string(n_ctx_));
++        }
++
++        std::mt19937_64 rng(req.value("seed", (uint64_t) 0));
++        llama_memory_clear(llama_get_memory(ctx_), true);
++
++        json steps = json::array();
++        std::vector<llama_token> generated;
++        int64_t t0 = now_ms();
++
++        // The prompt in chunks; only the last token needs logits.
++        int64_t prompt_last_off = 0;
++        for (int64_t off = 0; off < (int64_t) toks.size(); off += n_batch_) {
++            prompt_last_off = off;
++            const int64_t n = std::min<int64_t>(n_batch_, (int64_t) toks.size() - off);
++            std::vector<llama_token> chunk(toks.begin() + off, toks.begin() + off + n);
++            capture_state cs;
++            cs.filters = compile_filters(spec.tensors);
++            cs.mode = spec.mode;
++            cs.top_k = spec.top_k;
++            cs.positions = spec.positions;
++            cs.max_raw_bytes = spec.max_raw_bytes;
++            cs.offset = off;
++            cs.n_tokens = n;
++            g_capture.store(&cs, std::memory_order_release);
++            decode_chunk(chunk, off, off + n == (int64_t) toks.size());
++            g_capture.store(nullptr, std::memory_order_release);
++            if (off + n == (int64_t) toks.size() && capture_each) {
++                const auto arr = captures_to_json(cs);
++                if (!arr.empty()) steps.push_back({{"step", -1}, {"kind", "prompt"}, {"activations", arr}});
++            }
++        }
++
++        int64_t pos = (int64_t) toks.size();
++        // the batch index of the last decoded token's output; moved on every decode
++        int32_t logits_idx = (int32_t) ((int64_t) toks.size() - 1 - prompt_last_off);
++        for (int i = 0; i < max_tokens; ++i) {
++            float * l = llama_get_logits_ith(ctx_, logits_idx);
++            if (l == nullptr) throw std::runtime_error("no logits after the prompt");
++
++            const auto top = top_logits(l, logits_top);
++            const llama_token next = sample(l, temp, top_k, rng);
++
++            json step;
++            step["step"]  = i;
++            step["token"] = {{"id", next}, {"piece", piece(next)}};
++            step["logits"] = {{"top", top}};
++            if (capture_each) {
++                // captured below, on the next decode
++            }
++
++            generated.push_back(next);
++            if (llama_vocab_is_eog(vocab_, next)) {
++                steps.push_back(std::move(step));
++                break;
++            }
++
++            capture_state cs;
++            cs.filters = compile_filters(spec.tensors);
++            cs.mode = spec.mode;
++            cs.top_k = spec.top_k;
++            cs.positions = spec.positions;
++            cs.max_raw_bytes = spec.max_raw_bytes;
++            cs.offset = pos;
++            cs.n_tokens = 1;
++            g_capture.store(&cs, std::memory_order_release);
++            decode_chunk({next}, pos, true);
++            logits_idx = 0; // the single token just decoded
++            g_capture.store(nullptr, std::memory_order_release);
++            if (capture_each) {
++                const auto arr = captures_to_json(cs);
++                if (!arr.empty()) step["activations"] = arr;
++            }
++            steps.push_back(std::move(step));
++            pos++;
++        }
++
++        json out;
++        out["prompt_tokens"] = tokens_json(toks);
++        out["tokens"]        = tokens_json(generated);
++        out["text"]          = text_of(generated);
++        out["steps"]         = std::move(steps);
++        out["timings"]       = {{"ms", now_ms() - t0}};
++        return out;
++    }
++
++    json tensors(const json & req) {
++        std::lock_guard<std::mutex> lock(mu_);
++        auto toks = tokens_from_request(req);
++        if (toks.empty()) toks = tokenize("Hello", true, true);
++        if ((int64_t) toks.size() > n_ctx_) toks.resize(n_ctx_);
++
++        capture_spec spec;
++        spec.mode = "names";
++        pass_result r = run_pass(toks, 0, spec, {}, "none", {}, 0, false);
++
++        json arr = json::array();
++        for (const auto & name : r.order) {
++            const captured_tensor & ct = r.captures.at(name);
++            arr.push_back({{"name", ct.name},
++                           {"type", ct.type},
++                           {"ne", json::array({ct.ne[0], ct.ne[1], ct.ne[2], ct.ne[3]})},
++                           {"token_axis", ct.token_axis}});
++        }
++        std::sort(arr.begin(), arr.end(), [](const json & a, const json & b) {
++            return a.at("name").get<std::string>() < b.at("name").get<std::string>();
++        });
++        return json{{"n_tokens", toks.size()}, {"n_tensors", arr.size()}, {"tensors", arr}};
++    }
++
++private:
++    struct pass_result {
++        std::map<std::string, captured_tensor> captures;
++        std::vector<std::string> order;
++        std::map<int64_t, json> logits;
++        std::vector<intervention> interventions;
++        int64_t decoded = 0;
++    };
++
++    common_init_result_ptr init_;
++    llama_model * model_ = nullptr;
++    llama_context * ctx_ = nullptr;
++    const llama_vocab * vocab_ = nullptr;
++    std::string path_;
++    int n_ctx_ = 0;
++    int n_batch_ = 0;
++    std::mutex mu_;
++
++    static std::vector<std::regex> compile_filters(const std::vector<std::string> & patterns) {
++        std::vector<std::regex> out;
++        for (const auto & p : patterns) {
++            try {
++                out.emplace_back(p, std::regex::optimize);
++            } catch (const std::regex_error & e) {
++                throw std::invalid_argument("bad tensor pattern '" + p + "': " + e.what());
++            }
++        }
++        return out;
++    }
++
++    static capture_spec spec_from_json(const json & j) {
++        capture_spec s;
++        if (j.is_null() || j.empty()) return s;
++        if (j.contains("tensors")) {
++            if (!j.at("tensors").is_array()) throw std::invalid_argument("capture.tensors must be an array");
++            for (auto & v : j.at("tensors")) s.tensors.push_back(v.get<std::string>());
++        }
++        s.mode = j.value("mode", "summary");
++        if (s.mode != "summary" && s.mode != "raw" && s.mode != "names") {
++            throw std::invalid_argument("capture.mode must be summary, raw or names");
++        }
++        s.top_k = j.value("top_k", 8);
++        s.max_raw_bytes = j.value("max_raw_bytes", (int64_t) (64LL << 20));
++        if (j.contains("positions") && j.at("positions").is_array()) {
++            for (auto & v : j.at("positions")) s.positions.push_back(v.get<int64_t>());
++        }
++        return s;
++    }
++
++    static std::vector<intervention> interventions_from_json(const json & j) {
++        std::vector<intervention> out;
++        if (j.is_null() || !j.is_array()) return out;
++        for (const auto & e : j) {
++            if (!e.is_object()) throw std::invalid_argument("each intervention must be an object");
++            intervention iv;
++            iv.tensor = e.value("tensor", "");
++            if (iv.tensor.empty()) throw std::invalid_argument("intervention needs a tensor pattern");
++            if (e.contains("channels")) {
++                for (auto & v : e.at("channels")) iv.channels.push_back(v.get<int64_t>());
++            }
++            iv.channel_start = e.value("channel_start", (int64_t) -1);
++            iv.channel_end   = e.value("channel_end", (int64_t) -1);
++            iv.position      = e.value("position", (int64_t) -1);
++            iv.op            = e.value("op", "zero");
++            iv.value         = e.value("value", 0.0f);
++            if (iv.op != "zero" && iv.op != "scale" && iv.op != "add") {
++                throw std::invalid_argument("intervention op must be zero, scale or add");
++            }
++            out.push_back(std::move(iv));
++        }
++        return out;
++    }
++
++    std::vector<llama_token> tokens_from_request(const json & req) const {
++        if (req.contains("tokens")) {
++            std::vector<llama_token> toks;
++            for (auto & v : req.at("tokens")) toks.push_back(v.get<llama_token>());
++            return toks;
++        }
++        const std::string prompt = req.value("prompt", "");
++        return tokenize(prompt, req.value("add_special", true), req.value("parse_special", true));
++    }
++
++    json top_logits(const float * l, int k) const {
++        const int nv = llama_vocab_n_tokens(vocab_);
++        k = std::max(0, std::min(k, nv));
++        std::vector<int32_t> idx((size_t) nv);
++        for (int i = 0; i < nv; ++i) idx[(size_t) i] = i;
++        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
++                          [l](int32_t a, int32_t b) { return l[a] > l[b]; });
++
++        double mx = -INFINITY;
++        for (int i = 0; i < nv; ++i) mx = std::max(mx, (double) l[i]);
++        double z = 0;
++        for (int i = 0; i < nv; ++i) z += std::exp((double) l[i] - mx);
++
++        json arr = json::array();
++        for (int i = 0; i < k; ++i) {
++            const int id = idx[(size_t) i];
++            arr.push_back({{"id", id},
++                           {"piece", piece(id)},
++                           {"logit", l[id]},
++                           {"p", std::exp((double) l[id] - mx) / z}});
++        }
++        return arr;
++    }
++
++    json logits_entry(const float * l, int64_t index, int k, bool raw) const {
++        json j;
++        j["index"] = index;
++        j["top"]   = top_logits(l, k);
++
++        const int nv = llama_vocab_n_tokens(vocab_);
++        double mx = -INFINITY;
++        for (int i = 0; i < nv; ++i) mx = std::max(mx, (double) l[i]);
++        double z = 0, h = 0;
++        for (int i = 0; i < nv; ++i) z += std::exp((double) l[i] - mx);
++        for (int i = 0; i < nv; ++i) {
++            const double p = std::exp((double) l[i] - mx) / z;
++            if (p > 0) h -= p * std::log(p);
++        }
++        j["entropy"] = h;
++        if (raw) {
++            j["encoding"] = "f32le-base64";
++            j["data"]     = b64(l, (size_t) nv * sizeof(float));
++        }
++        return j;
++    }
++
++    void decode_chunk(const std::vector<llama_token> & chunk, int64_t pos0, bool want_logits) {
++        llama_batch batch = llama_batch_init((int32_t) chunk.size(), 0, 1);
++        batch.n_tokens = (int32_t) chunk.size();
++        for (int32_t i = 0; i < batch.n_tokens; ++i) {
++            batch.token[i]    = chunk[(size_t) i];
++            batch.pos[i]      = (llama_pos) (pos0 + i);
++            batch.n_seq_id[i] = 1;
++            batch.seq_id[i][0] = 0;
++            batch.logits[i]   = (want_logits && i == batch.n_tokens - 1) ? 1 : 0;
++        }
++        const int rc = llama_decode(ctx_, batch);
++        llama_batch_free(batch);
++        if (rc != 0) throw std::runtime_error("llama_decode failed with " + std::to_string(rc));
++    }
++
++    pass_result run_pass(const std::vector<llama_token> & toks,
++                         int64_t pos0,
++                         const capture_spec & spec,
++                         std::vector<intervention> iv,
++                         const std::string & logits_mode,
++                         const std::vector<int64_t> & positions,
++                         int top_k,
++                         bool raw_logits) {
++        pass_result out;
++        out.interventions = std::move(iv);
++
++        std::unordered_set<int64_t> wanted;
++        if (logits_mode == "all") {
++            for (int64_t i = 0; i < (int64_t) toks.size(); ++i) wanted.insert(pos0 + i);
++        } else if (logits_mode == "indices") {
++            for (auto p : positions) wanted.insert(p < 0 ? pos0 + (int64_t) toks.size() + p : p);
++        } else if (logits_mode == "last") {
++            wanted.insert(pos0 + (int64_t) toks.size() - 1);
++        } else if (logits_mode != "none") {
++            throw std::invalid_argument("logits.positions must be last, all, indices or none");
++        }
++        if (logits_mode == "all" && toks.size() > 2048) {
++            throw std::invalid_argument("all-position logits are limited to 2048 tokens; use indices");
++        }
++
++        llama_memory_clear(llama_get_memory(ctx_), true);
++
++        for (int64_t off = 0; off < (int64_t) toks.size(); off += n_batch_) {
++            const int64_t n = std::min<int64_t>(n_batch_, (int64_t) toks.size() - off);
++            std::vector<llama_token> chunk(toks.begin() + off, toks.begin() + off + n);
++
++            capture_state cs;
++            cs.filters      = compile_filters(spec.tensors);
++            prepare_iv(cs, out.interventions);
++            cs.mode         = spec.mode;
++            cs.top_k        = spec.top_k;
++            cs.positions    = spec.positions;
++            cs.max_raw_bytes = spec.max_raw_bytes;
++            cs.offset       = pos0 + off;
++            cs.n_tokens     = n;
++
++            g_capture.store(&cs, std::memory_order_release);
++            try {
++                llama_batch batch = llama_batch_init((int32_t) n, 0, 1);
++                batch.n_tokens = (int32_t) n;
++                bool any_output = false;
++                for (int64_t i = 0; i < n; ++i) {
++                    const bool want = wanted.count(pos0 + off + i) > 0;
++                    batch.token[i]     = chunk[(size_t) i];
++                    batch.pos[i]       = (llama_pos) (pos0 + off + i);
++                    batch.n_seq_id[i]  = 1;
++                    batch.seq_id[i][0] = 0;
++                    batch.logits[i]    = want ? 1 : 0;
++                    any_output = any_output || want;
++                }
++                const int rc = llama_decode(ctx_, batch);
++                llama_batch_free(batch);
++                if (rc != 0) throw std::runtime_error("llama_decode failed with " + std::to_string(rc));
++
++                if (any_output) {
++                    for (int64_t i = 0; i < n; ++i) {
++                        const int64_t gpos = pos0 + off + i;
++                        if (!wanted.count(gpos)) continue;
++                        float * l = llama_get_logits_ith(ctx_, (int32_t) i);
++                        if (l == nullptr) {
++                            throw std::runtime_error("logits are not available at position " + std::to_string(gpos));
++                        }
++                        out.logits[gpos] = logits_entry(l, gpos, top_k, raw_logits);
++                    }
++                }
++            } catch (...) {
++                g_capture.store(nullptr, std::memory_order_release);
++                throw;
++            }
++            g_capture.store(nullptr, std::memory_order_release);
++
++            out.decoded += n;
++            for (const auto & name : cs.order) {
++                auto it = out.captures.find(name);
++                if (it == out.captures.end()) {
++                    out.captures.emplace(name, cs.out.at(name));
++                    out.order.push_back(name);
++                } else {
++                    // chunks cover disjoint token ranges; append in order
++                    auto & dst = it->second.tokens;
++                    const auto & src = cs.out.at(name).tokens;
++                    dst.insert(dst.end(), src.begin(), src.end());
++                    it->second.truncated = it->second.truncated || cs.out.at(name).truncated;
++                }
++            }
++        }
++        return out;
++    }
++
++    json result_to_json(const std::vector<llama_token> & toks,
++                        const pass_result & r,
++                        const capture_spec & spec) const {
++        json out;
++        out["model"]     = path_;
++        out["tokens"]    = tokens_json(toks);
++        out["n_tokens"]  = toks.size();
++        out["decoded"]   = r.decoded;
++
++        json logs = json::array();
++        for (const auto & [idx, entry] : r.logits) logs.push_back(entry);
++        out["logits"] = std::move(logs);
++
++        capture_state tmp;
++        tmp.mode = spec.mode;
++        tmp.out  = r.captures;
++        tmp.order = r.order;
++        out["activations"] = captures_to_json(tmp);
++
++        json ivs = json::array();
++        for (const auto & iv : r.interventions) {
++            ivs.push_back({{"tensor", iv.tensor},
++                           {"op", iv.op},
++                           {"value", iv.value},
++                           {"position", iv.position},
++                           {"matched", iv.matched},
++                           {"modified", iv.modified}});
++        }
++        out["interventions"] = std::move(ivs);
++        return out;
++    }
++
++    std::string text_of(const std::vector<llama_token> & toks) const {
++        std::string s;
++        for (auto t : toks) s += piece(t);
++        return s;
++    }
++
++    llama_token sample(const float * l, float temp, int top_k, std::mt19937_64 & rng) const {
++        const int nv = llama_vocab_n_tokens(vocab_);
++        if (temp <= 0.0f) {
++            int best = 0;
++            for (int i = 1; i < nv; ++i) if (l[i] > l[best]) best = i;
++            return best;
++        }
++        std::vector<int32_t> idx((size_t) nv);
++        for (int i = 0; i < nv; ++i) idx[(size_t) i] = i;
++        const int k = std::max(1, std::min(top_k > 0 ? top_k : nv, nv));
++        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
++                          [l](int32_t a, int32_t b) { return l[a] > l[b]; });
++        std::vector<double> p((size_t) k);
++        double mx = l[idx[0]];
++        double z = 0;
++        for (int i = 0; i < k; ++i) {
++            p[(size_t) i] = std::exp((l[idx[(size_t) i]] - mx) / temp);
++            z += p[(size_t) i];
++        }
++        std::uniform_real_distribution<double> dist(0.0, z);
++        double x = dist(rng);
++        for (int i = 0; i < k; ++i) {
++            x -= p[(size_t) i];
++            if (x <= 0) return idx[(size_t) i];
++        }
++        return idx[(size_t) k - 1];
++    }
++};
++
++// ---------------------------------------------------------------------------
++// HTTP
++// ---------------------------------------------------------------------------
++
++json parse_body(const std::string & body) {
++    if (body.empty()) return json::object();
++    try {
++        return json::parse(body);
++    } catch (const std::exception & e) {
++        throw std::invalid_argument(std::string("invalid JSON: ") + e.what());
++    }
++}
++
++void reply(httplib::Response & res, const std::function<json()> & fn) {
++    try {
++        res.status = 200;
++        res.set_content(fn().dump(), "application/json");
++    } catch (const std::invalid_argument & e) {
++        res.status = 400;
++        res.set_content(json{{"error", e.what()}}.dump(), "application/json");
++    } catch (const std::exception & e) {
++        res.status = 500;
++        res.set_content(json{{"error", e.what()}}.dump(), "application/json");
++    }
++}
++
++} // namespace
++
++int llama_inspect_main(int argc, char ** argv) {
++    common_params params;
++    // The tool has no authentication; loopback unless the caller says otherwise.
++    params.hostnames = {"127.0.0.1"};
++    params.port      = 8090;
++    common_init();
++
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
++        return 1;
++    }
++    if (params.model.path.empty()) {
++        fprintf(stderr, "llama-inspect: -m <model.gguf> is required\n");
++        return 1;
++    }
++    // One sequence: a capture is the whole batch, not one slot of several.
++    if (params.n_parallel < 1) {
++        params.n_parallel = 1;
++    }
++
++    std::unique_ptr<engine> eng;
++    try {
++        eng = std::make_unique<engine>(params);
++    } catch (const std::exception & e) {
++        fprintf(stderr, "llama-inspect: %s\n", e.what());
++        return 1;
++    }
++
++    fprintf(stderr, "llama-inspect: model %s\n", eng->path().c_str());
++    const std::string host = params.hostnames.empty() ? "127.0.0.1" : params.hostnames.front();
++    fprintf(stderr, "llama-inspect: listening on http://%s:%d\n", host.c_str(), params.port);
++
++    httplib::Server svr;
++    svr.set_read_timeout(600, 0);
++    svr.set_write_timeout(600, 0);
++    svr.set_payload_max_length(256LL << 20);
++
++    svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
++        res.set_content(json{{"status", "ok"}, {"model", eng->path()}}.dump(), "application/json");
++    });
++
++    svr.Get("/v1/inspect/info", [&](const httplib::Request &, httplib::Response & res) {
++        reply(res, [&] { return eng->info(); });
++    });
++
++    svr.Post("/v1/inspect/tokenize", [&](const httplib::Request & req, httplib::Response & res) {
++        reply(res, [&] { return eng->tokenize_request(parse_body(req.body)); });
++    });
++
++    svr.Post("/v1/inspect/forward", [&](const httplib::Request & req, httplib::Response & res) {
++        reply(res, [&] { return eng->forward(parse_body(req.body)); });
++    });
++
++    svr.Post("/v1/inspect/generate", [&](const httplib::Request & req, httplib::Response & res) {
++        reply(res, [&] { return eng->generate(parse_body(req.body)); });
++    });
++
++    svr.Post("/v1/inspect/tensors", [&](const httplib::Request & req, httplib::Response & res) {
++        reply(res, [&] { return eng->tensors(parse_body(req.body)); });
++    });
++
++    if (!svr.listen(host, params.port)) {
++        fprintf(stderr, "llama-inspect: cannot listen on %s:%d\n", host.c_str(), params.port);
++        return 1;
++    }
++    return 0;
++}
+diff --git a/tools/inspect/inspect.h b/tools/inspect/inspect.h
+new file mode 100644
+index 0000000..36cb508
+--- /dev/null
++++ b/tools/inspect/inspect.h
+@@ -0,0 +1,20 @@
++// llama-inspect: llama.cpp's inference, opened up.
++//
++// The server exposes what a chat client needs: text, top-n logprobs, timings.
++// This tool exposes what an interpretability experiment needs: the full logit
++// vector at any position, the intermediate tensors of the graph (FFN
++// activations, attention outputs, the embedding), and the ability to change
++// those tensors in place and see what the model does next.
++//
++// It runs the model itself, on one context, one request at a time, so a
++// capture is always the whole batch and a tensor's second dimension is always
++// the token index. That is the property the server cannot offer, because its
++// scheduler interleaves slots.
++//
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++// Runs the tool; defined in inspect.cpp. main.cpp is a shim so the PS5 build
++// can wrap main() without touching this file.
++int llama_inspect_main(int argc, char ** argv);
+diff --git a/tools/inspect/main.cpp b/tools/inspect/main.cpp
+new file mode 100644
+index 0000000..4c6018c
+--- /dev/null
++++ b/tools/inspect/main.cpp
+@@ -0,0 +1,5 @@
++#include "inspect.h"
++
++int main(int argc, char ** argv) {
++    return llama_inspect_main(argc, argv);
++}

@@ -14,7 +14,7 @@ add_subdirectory(${LLAMA_DIR} llama.cpp)
 
 # The tools leave through _Exit when main returns, skipping Sony's exit() and
 # the static destructors it runs (compat/exit.cpp, issue #3).
-foreach(tool llama-cli llama-server llama-bench llama-completion)
+foreach(tool llama-cli llama-server llama-inspect llama-bench llama-completion)
     if(TARGET ${tool})
         target_sources(${tool} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/compat/exit.cpp")
         target_link_options(${tool} PRIVATE "LINKER:--wrap=main")

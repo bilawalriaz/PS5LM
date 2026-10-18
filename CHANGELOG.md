@@ -5,6 +5,18 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Added
+- **`llama-inspect`**, a second payload (and cmake target) that opens the model up for experiments:
+  the full logit vector at any position, any graph tensor by name (`ffn_gate-L`, `kqv_out-L`, ...)
+  as per-token summaries or raw `float32`, in-place interventions on those tensors (zero, scale,
+  add a channel of one neuron or head), a `baseline: true` mode that runs a prompt both ways in one
+  call, and greedy generation with per-step logits and activations. One context, one request at a
+  time, so a capture is the whole batch and a tensor's token axis is unambiguous
+  ([docs/INSPECT.md](docs/INSPECT.md), `scripts/ps5lm_inspect.py`,
+  `examples/interpret/neuron_probe.py`). CPU only for now: the GPU belongs to the app.
+
 ## [0.9.0] - 2026-10-16
 
 ### Added
