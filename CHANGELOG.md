@@ -15,7 +15,10 @@ v0.1.x are the upstream payload releases by cobanov.
   `/health` stayed 200. On the console a full queue now drops the line and counts it, and the writer
   logs `N log lines dropped, the log writer fell behind` once it catches up
   (`patches/0010-log-never-blocks.patch`). With it, `LLAMA_ARG_LOG_VERBOSITY=2` in `env.txt`
-  should no longer be needed to keep a sweep alive. Not yet built or run on the console.
+  should no longer be needed to keep a sweep alive. On the console (MiniCPM5-2B Q8_0, default
+  verbosity), 3,000 back-to-back uncached `/v1/introspect` ablations all answered (p50 48 ms, p99
+  79 ms, one 10.6 s stall ridden out) and `/slots` answered in 12 ms afterwards; before, about 300
+  such requests froze the server for good.
 
 ## [0.10.1] - 2026-10-18
 
