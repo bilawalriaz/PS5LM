@@ -5,6 +5,21 @@ Versions follow [semver](https://semver.org). The app's version is set in
 `v<version>` and ships `ps5lm-app-v<version>.zip` (see `scripts/release-app.sh`).
 v0.1.x are the upstream payload releases by cobanov.
 
+## [Unreleased]
+
+### Added
+- **An opt-in endpoint for the model's own numbers**: `POST /v1/introspect` answers with the whole
+  logit row at the positions you name, the top candidates with their probabilities, the entropy, and
+  one row of a named graph tensor (`l_out`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`,
+  `result_norm`, `result_output`) for a named layer. A request can also change one channel in place,
+  with zero, scale or add, at one position or at all of them. `messages` applies the chat template
+  first. It is off by default: Settings > Developer > "Logits and activations API", or
+  `LLAMA_INTROSPECT=1`. `docs/INTROSPECTION.md` is the reference and `scripts/ps5lm-introspect.py`
+  is a client.
+- The patch reads the logits from the context's own output buffer and copies the tensors out of the
+  compute graph with the eval callback that llama.cpp already has, so no work is repeated and no
+  request pays for it unless it asks.
+
 ## [0.9.1] - 2026-10-20
 
 ### Fixed
