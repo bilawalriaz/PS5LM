@@ -100,16 +100,29 @@ Tensors are named by llama.cpp's graph; `-<layer>` is appended for per-layer
 ones. For the `llama` architecture (which is what MiniCPM5-2B, Qwen, Mistral,
 LFM2 and most GGUFs declare):
 
-| Tensor | What it is | Delivered? |
-|---|---|---|
-| `attn_norm-<il>` | Residual stream after the block's input norm | yes |
-| `attn_out-<il>` | Attention output, before the residual add | yes |
-| `ffn_norm-<il>` | Residual stream after the post-attention norm | yes |
-| `ffn_out-<il>` | MLP output, before the residual add (one channel = one FFN neuron) | yes |
-| `l_out-<il>` | Residual stream after block `il`; `l_out-<il-1>` is the input of block `il` | yes |
-| `result_norm` | Final hidden state, before the output projection | yes |
-| `result_output` | The logits tensor of the graph itself | yes |
-| `inp_embd` | Token embedding + position, at the graph's input | **no** — the graph names it, but neither the CPU nor the Vulkan backend offers that node to the eval callback in this revision (upstream's `examples/eval-callback` shows it on CUDA). Use `attn_norm-0` for the residual entering block 0 |
+| Tensor | What it is |
+|---|---|
+| `embd` | The token embedding + position row: the input of block 0 |
+| `attn_norm-<il>` | Residual stream after the block's input norm |
+| `kqv_out-<il>` | The fused Q/K/V projection output |
+| `attn_out-<il>` | Attention output, before the residual add |
+| `ffn_norm-<il>` | Residual stream after the post-attention norm |
+| `ffn_gate-<il>` | MLP gate pre-activation — one channel is one FFN neuron before SwiGLU |
+| `ffn_swiglu-<il>` | The gate x up activation, i.e. what the neuron actually emits |
+| `ffn_out-<il>` | MLP output, before the residual add (down-projection result) |
+| `l_out-<il>` | Residual stream after block `il`; `l_out-<il-1>` is the input of block `il` |
+| `result_norm` | Final hidden state, before the output projection |
+| `result_output` | The logits tensor of the graph itself |
+
+These are the names a `llama`-architecture GGUF (which is what MiniCPM5, Qwen,
+Mistral, LFM2 and most of the catalogue declare) delivers on both backends; the
+list is measured, not guessed, so a name outside it is not delivered rather than
+mis-addressed. Two that look like they should work do not in this revision:
+`inp_embd` (the graph names that node, but the scheduler never offers it to the
+callback here — use `embd`) and `inp_pos` (positions; the answer's `inputs` carry
+the token ids and pieces instead). Other architectures name their tensors in
+`src/models/<arch>.cpp` and may deliver different sets (`ffn_moe_*` for MoE
+models, for instance).
 
 A name that is not delivered simply does not appear in the answer; the request
 still succeeds. `docs/INSPECT.md`'s tool has its own capture path and lists its

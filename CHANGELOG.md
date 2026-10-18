@@ -12,9 +12,11 @@ v0.1.x are the upstream payload releases by cobanov.
   ask for the full row reported a certainty the model did not have. The console run exposed it (an
   entropy of 1.176 nats printed next to `p=1.0000`); the value is now `exp(-logsumexp)` and matches
   `softmax()` of the full vocabulary row to 1e-9. The top-k probabilities were always correct.
-- `docs/INTROSPECTION.md` says which activation tensors this revision's backends actually deliver:
-  `attn_norm`, `attn_out`, `ffn_norm`, `ffn_out`, `l_out`, `result_norm` and `result_output` come
-  back; `inp_embd` does not (the graph names that node, the scheduler does not offer it here).
+- `docs/INTROSPECTION.md` now lists the activation tensors this revision actually delivers on both
+  backends, measured on the console rather than assumed: `embd`, `attn_norm`, `kqv_out`, `attn_out`,
+  `ffn_norm`, `ffn_gate`, `ffn_swiglu`, `ffn_out`, `l_out`, `result_norm` and `result_output`.
+  `inp_embd` and `inp_pos` are not delivered (the graph names the first, the scheduler does not offer
+  it; the second does not exist as a row per token).
 
 ## [0.10.0] - 2026-10-18
 
