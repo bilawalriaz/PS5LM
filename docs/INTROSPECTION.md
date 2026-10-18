@@ -100,16 +100,20 @@ Tensors are named by llama.cpp's graph; `-<layer>` is appended for per-layer
 ones. For the `llama` architecture (which is what MiniCPM5-2B, Qwen, Mistral,
 LFM2 and most GGUFs declare):
 
-| Tensor | What it is |
-|---|---|
-| `inp_embd` | Token embedding + position: the residual stream entering block 0 |
-| `attn_norm-<il>` | Residual stream after the block's input norm |
-| `attn_out-<il>` | Attention output, before the residual add |
-| `ffn_norm-<il>` | Residual stream after the post-attention norm |
-| `ffn_out-<il>` | MLP output, before the residual add |
-| `l_out-<il>` | Residual stream after block `il`; `l_out-<il-1>` is the input of block `il` |
-| `result_norm` | Final hidden state, before the output projection |
-| `result_output` | The logits tensor itself |
+| Tensor | What it is | Delivered? |
+|---|---|---|
+| `attn_norm-<il>` | Residual stream after the block's input norm | yes |
+| `attn_out-<il>` | Attention output, before the residual add | yes |
+| `ffn_norm-<il>` | Residual stream after the post-attention norm | yes |
+| `ffn_out-<il>` | MLP output, before the residual add (one channel = one FFN neuron) | yes |
+| `l_out-<il>` | Residual stream after block `il`; `l_out-<il-1>` is the input of block `il` | yes |
+| `result_norm` | Final hidden state, before the output projection | yes |
+| `result_output` | The logits tensor of the graph itself | yes |
+| `inp_embd` | Token embedding + position, at the graph's input | **no** — the graph names it, but neither the CPU nor the Vulkan backend offers that node to the eval callback in this revision (upstream's `examples/eval-callback` shows it on CUDA). Use `attn_norm-0` for the residual entering block 0 |
+
+A name that is not delivered simply does not appear in the answer; the request
+still succeeds. `docs/INSPECT.md`'s tool has its own capture path and lists its
+own names.
 
 Other architectures name their tensors in `src/models/<arch>.cpp`; a name that
 does not exist is simply not captured, and the answer then has no activations
@@ -222,6 +226,11 @@ Set in `/data/PS5LM/env.txt` (one `NAME=value` per line; the app applies
   backend) with a small test model: logits, full rows, entropy, all-positions
   capture, the chat-template path, the budget, the disabled mode and
   interventions were all run.
+- [LOCALLY BUILT] `argmax.prob` is the argmax's real probability: it was
+  hardcoded to 1.0 before this fix, which the console run exposed (the entropy
+  and the top-k probabilities were right all along, so the mismatch was visible
+  as an entropy of 1.176 nats next to `p=1.0000`). Verified against `softmax()`
+  of the full vocabulary row, to 1e-9.
 - [TESTED-ON-CONSOLE] Run on a 13.60 PS5 with MiniCPM5-2B Q8_0 on the GPU
   (ggml-vulkan on RADV), release v0.10.0: logits, a full row of exactly
   `n_vocab` floats, 13 activation tensors for four layers, every prompt

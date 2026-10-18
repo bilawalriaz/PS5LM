@@ -460,10 +460,10 @@ index ed23f7d..d2ae01d 100644
  
 diff --git a/tools/server/server-introspect.cpp b/tools/server/server-introspect.cpp
 new file mode 100644
-index 0000000..f88148f
+index 0000000..29dce8b
 --- /dev/null
 +++ b/tools/server/server-introspect.cpp
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,624 @@
 +#include "server-introspect.h"
 +
 +#include "common.h"
@@ -1054,7 +1054,9 @@ index 0000000..f88148f
 +
 +    out = json::object();
 +    out["n_vocab"] = n_vocab;
-+    out["argmax"]  = introspect_token_json(vocab, best, best_logit, p.want_probs ? 1.0f : 0.0f, p.want_probs);
++    // the argmax's own probability is exp(0 - logsumexp), not 1.0
++    out["argmax"]  = introspect_token_json(vocab, best, best_logit,
++                                           need_norm ? (float) std::exp(-log_sum) : 0.0f, p.want_probs);
 +
 +    if (p.top_k > 0) {
 +        const std::vector<int32_t> top = introspect_top_k(logits, n_vocab, p.top_k);

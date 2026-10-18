@@ -11,7 +11,7 @@ v0.1.x are the upstream payload releases by cobanov.
 - **Introspection**: `POST /v1/introspect` returns the raw logits the model computed — argmax, an
   optional top-k, an optional full-vocabulary float row, entropy — for the prompt positions and the
   generated tokens you name, together with the **per-layer activations** copied out of the compute
-  graph (`l_out`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`, `inp_embd`, `result_norm`) for the
+  graph (`l_out`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`, `result_norm`, `result_output`) for the
   layers you name. The same `introspect` field works on `/completion`. See
   [docs/INTROSPECTION.md](docs/INTROSPECTION.md) and `scripts/ps5lm-introspect.py`.
 - **Interventions** in the same request: zero, scale or add a value to one channel (a single FFN
@@ -29,6 +29,11 @@ v0.1.x are the upstream payload releases by cobanov.
   intervention that changed 20,480 elements and moved the argmax with a top-10 KL of 0.915 nats. The
   same token's tensors are byte-identical between batched and step-by-step capture. `docs/CONSOLE.md`
   has the table.
+
+### Fixed
+- `argmax.prob` is the argmax's real probability. It was hardcoded to `1.0`, so an answer that did
+  not ask for the full row reported a certainty the model did not have (the entropy and the top-k
+  probabilities were correct, which is how the console run exposed it).
 
 ### Changed
 - The request feed on Home ignores introspection requests: their answers are raw numbers, and one of
