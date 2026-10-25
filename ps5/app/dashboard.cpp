@@ -113,7 +113,7 @@ constexpr SettingCategory kCategories[] = {
       2 },
     { "Developer",
       { { Setting::introspect, "Logits and activations API",
-          "Off: /v1/introspect is closed. On: it answers with the model's raw numbers" } },
+          "Off: /v1/introspect is closed. On: the raw numbers. A change restarts the model" } },
       1 },
     { "Diagnostics", {}, 0 },
 };

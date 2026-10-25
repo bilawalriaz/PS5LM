@@ -12,7 +12,7 @@ index 70b8d7d..7da0f33 100644
  
  if (BUILD_SHARED_LIBS)
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 60c5633..8d21298 100644
+index 60c5633..c785782 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -292,6 +292,13 @@ struct server_slot {
@@ -103,7 +103,7 @@ index 60c5633..8d21298 100644
          if (model_tgt == nullptr) {
              SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
              return false;
-@@ -1230,6 +1275,13 @@ private:
+@@ -1230,6 +1277,13 @@ private:
  
          vocab = llama_model_get_vocab(model_tgt);
  
@@ -117,7 +117,7 @@ index 60c5633..8d21298 100644
          try {
              decision.init(model_tgt);
          } catch (const std::exception & e) {
-@@ -2290,6 +2342,27 @@ private:
+@@ -2290,6 +2344,27 @@ private:
  
          res->generation_params = slot.task->params; // copy the parameters
  
@@ -145,7 +145,7 @@ index 60c5633..8d21298 100644
          queue_results.send(std::move(res));
      }
  
-@@ -3231,13 +3304,30 @@ private:
+@@ -3231,13 +3306,35 @@ private:
          int32_t off_next = 0;
          int32_t n_batch = llama_n_batch(ctx_tgt);
          for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -158,8 +158,13 @@ index 60c5633..8d21298 100644
 +                n_batch_use = std::min(n_batch, introspect_step);
 +            }
 +            const int32_t n_tokens = std::min(n_batch_use, batch.size() - off);
-+            // PS5LM fork: the capture maps a tensor row back to a token index with this
-+            introspect_capture.chunk_off = off;
++            // PS5LM fork: the capture maps a tensor row back to the token's sequence
++            // position with this. The batch offset is not that position: a generated
++            // token decodes at offset 0, and a reused prefix shifts the prompt rows.
++            introspect_capture.row_pos.clear();
++            for (int32_t i = off; i < off + n_tokens; ++i) {
++                introspect_capture.row_pos.push_back(batch.tokens[i].pos[0]);
++            }
              try {
                  scoped_timer t(t_decode, n_decode);
                  // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -178,7 +183,7 @@ index 60c5633..8d21298 100644
  #ifdef DEBUG_TIMINGS
                  llama_synchronize(ctx_tgt);
  #endif
-@@ -3978,13 +4068,21 @@ private:
+@@ -3978,13 +4075,21 @@ private:
                              break;
                          }
  
@@ -201,7 +206,7 @@ index 60c5633..8d21298 100644
                              /* is_prompt = */ true);
                          if (!slot.task->decision.order.empty()) {
                              batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
-@@ -4286,6 +4384,159 @@ private:
+@@ -4286,6 +4391,159 @@ private:
          return true;
      }
  
@@ -361,7 +366,7 @@ index 60c5633..8d21298 100644
      void post_decode(int32_t n_batch_tokens, int32_t off) {
          // for checking if a given batch index is inside the current sub-batch
          auto is_inside_view = [&](int32_t idx) {
-@@ -4842,6 +5093,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -4842,6 +5100,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
              task.apply_chat_session(chat_session);
  
@@ -386,18 +391,17 @@ index 60c5633..8d21298 100644
 +                    // every position has to be evaluated in this request
 +                    task.params.cache_prompt = false;
 +                }
-+                for (const auto & iv : task.params.introspect.interventions) {
-+                    if (iv.position >= 0) {
-+                        // the target position must be evaluated in this request
-+                        task.params.cache_prompt = false;
-+                    }
++                if (!task.params.introspect.interventions.empty()) {
++                    // a reused prefix never runs the graph, so an intervention would
++                    // touch only the uncached suffix: every position must be evaluated
++                    task.params.cache_prompt = false;
 +                }
 +            }
 +
              task.id_slot = json_value(data, "id_slot", -1);
              sse_ping_interval = task.params.sse_ping_interval;
  
-@@ -5690,6 +5970,49 @@ void server_routes::init_routes() {
+@@ -5690,6 +5976,49 @@ void server_routes::init_routes() {
          return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
      };
  
@@ -462,7 +466,7 @@ index ed23f7d..d2ae01d 100644
  
 diff --git a/tools/server/server-introspect.cpp b/tools/server/server-introspect.cpp
 new file mode 100644
-index 0000000..29dce8b
+index 0000000..af9c2ee
 --- /dev/null
 +++ b/tools/server/server-introspect.cpp
 @@ -0,0 +1,624 @@
@@ -902,7 +906,7 @@ index 0000000..29dce8b
 +    bool changed = false;
 +    for (auto * iv : hits) {
 +        for (int64_t i1 = 0; i1 < ne1; ++i1) {
-+            if (iv->position >= 0 && iv->position != chunk_off + i1) {
++            if (iv->position >= 0 && (i1 >= (int64_t) row_pos.size() || iv->position != row_pos[i1])) {
 +                continue;
 +            }
 +            for (int64_t i0 = 0; i0 < ne0; ++i0) {
@@ -1092,7 +1096,7 @@ index 0000000..29dce8b
 +}
 diff --git a/tools/server/server-introspect.h b/tools/server/server-introspect.h
 new file mode 100644
-index 0000000..47f24cc
+index 0000000..a80f7e1
 --- /dev/null
 +++ b/tools/server/server-introspect.h
 @@ -0,0 +1,205 @@
@@ -1238,7 +1242,7 @@ index 0000000..47f24cc
 +
 +    std::unordered_set<std::string> names;  // exact ggml tensor names to match
 +    int64_t row = -1;                       // row to keep within the tensor, -1 = the last row
-+    int64_t chunk_off = 0;                  // token index of row 0 of the chunk being decoded
++    std::vector<int64_t> row_pos;           // sequence position (pos[0]) of each row of the chunk being decoded
 +
 +    std::vector<server_introspect_intervention> ivs;  // applied when a tensor matches one
 +

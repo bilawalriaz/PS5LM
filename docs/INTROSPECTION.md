@@ -156,7 +156,7 @@ makes a per-position capture of those tensors possible at all.
   them after `LLAMA_INTROSPECT_MAX_BYTES` (default 256 MiB) and sets
   `"truncated": true`.
 - The request occupies the server's slot like any generation, and
-  `positions: "all"` disables prompt caching for that request.
+  `positions: "all"` or any intervention disables prompt caching for that request.
 
 ## Interventions: change an activation, not just read it
 
@@ -174,7 +174,7 @@ stop saying X?".
     "logits": {"top_k": 10, "probs": true},
     "positions": "last",
     "interventions": [
-      {"tensor": "ffn_out", "layers": [12], "channels": [3456], "op": "zero"}
+      {"tensor": "ffn_swiglu", "layers": [12], "channels": [3456], "op": "zero"}
     ]
   }
 }
@@ -182,10 +182,10 @@ stop saying X?".
 
 | Field | Meaning |
 |---|---|
-| `tensor` | Base name (`ffn_out`) or an exact node name (`ffn_out-12`) |
+| `tensor` | Base name (`ffn_swiglu`) or an exact node name (`ffn_swiglu-12`). One channel of `ffn_swiglu` is one FFN neuron; one channel of `ffn_out` is one of the `n_embd` residual features that the down projection writes |
 | `layers` | Which layers a base name expands to (default: all) |
 | `channels` | Channel indices to change; or `channel_start`/`channel_end` (end exclusive); neither means the whole row |
-| `position` | Token index of the request; default `-1` = every position |
+| `position` | The token's sequence position, its `index` in `inputs` (generated tokens continue after the prompt); default `-1` = every position |
 | `op` | `zero`, `scale` (multiply by `value`) or `add` (`value`) |
 | `value` | Operand of `scale`/`add` |
 
@@ -198,10 +198,14 @@ Notes that matter:
 - The change is applied inside the graph-eval callback, i.e. after llama.cpp has
   finished computing that tensor and before anything consumes it, so it affects
   exactly the forward pass that follows.
-- A `position` intervention forces the prompt to be evaluated one token at a
-  time, and *any* intervention that changed something makes the server drop the
-  prompt cache afterwards: the KV entries of an intervened pass are not the ones
-  a later request should reuse.
+- Any intervention evaluates the whole prompt in its own request: a prefix taken
+  from the prompt cache never runs the graph, so the intervention would reach
+  only the uncached rest. A baseline and an ablation of the same prompt therefore
+  see the same positions, and their `modified` counts compare.
+- A `position` intervention also evaluates the prompt one token at a time, and
+  *any* intervention that changed something makes the server drop the prompt
+  cache afterwards: the KV entries of an intervened pass are not the ones a later
+  request should reuse.
 - Interventions need the tensor to be `float32`/`float16`/`bfloat16` and at most
   64 MiB; anything else is left alone.
 - Compare against a baseline by sending the same request twice, once without
@@ -215,7 +219,7 @@ Logits and activations API** is the switch:
 
 | Name | Default | Meaning |
 |---|---|---|
-| `LLAMA_INTROSPECT` | off | Set it to `1` to enable the endpoint. The Settings row "Logits and activations API" sets it for you |
+| `LLAMA_INTROSPECT` | off | Set it to `1` to enable the endpoint. In the app, the Settings row "Logits and activations API" sets it and wins over `env.txt`; changing the row restarts the app with the loaded model, because the server reads the variable only when it starts |
 | `LLAMA_INTROSPECT_MAX_BYTES` | `268435456` | Cap on the activations one request may return |
 
 With the endpoint off, `/v1/introspect` answers 501 and every other request works as before.

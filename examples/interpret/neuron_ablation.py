@@ -7,9 +7,10 @@
 The loop this closes is the whole point of the endpoint:
 
 1. ask for the model's **logits** at the last prompt position, with the whole
-   vocabulary row, and the **ffn_out** activation of one layer at that position;
-2. rank that layer's channels by how strongly they fire (the FFN neurons that are
-   doing something for this token);
+   vocabulary row, and the **ffn_swiglu** activation of one layer at that position:
+   gate x up, one channel per FFN neuron, the input of the down projection;
+2. rank that layer's neurons by how strongly they fire (the ones that are doing
+   something for this token);
 3. for each candidate, send the same request again with that one channel **zeroed**
    in place, and measure what changed: the target token's probability, its rank,
    and the exact KL divergence of the next-token distribution over the whole
@@ -19,8 +20,11 @@ Everything except the ranking comes from one request per candidate. A layer whos
 ablation barely moves anything is a layer that is not carrying this decision; the
 channels at the top of the last column are the ones worth looking at next.
 
-`--full-row` is on by default because the KL is then exact (over all `n_vocab`
-values); pass `--top-only` to trade that for a tenth of the traffic.
+`--tensor ffn_out` asks a different question: its channels are the `n_embd`-wide
+residual features that the down projection writes, not neurons.
+
+The full vocabulary row is on by default because the KL is then exact (over all
+`n_vocab` values); pass `--top-only` to trade that for a tenth of the traffic.
 """
 
 from __future__ import annotations
@@ -90,7 +94,8 @@ def main() -> int:
     p.add_argument("--host", required=True)
     p.add_argument("--prompt", default="The capital of France is")
     p.add_argument("--layer", type=int, default=20)
-    p.add_argument("--tensor", default="ffn_out", help="ffn_out (one neuron per channel) or l_out, attn_out, ...")
+    p.add_argument("--tensor", default="ffn_swiglu",
+                   help="ffn_swiglu (one FFN neuron per channel), or ffn_out, l_out, attn_out (n_embd residual features)")
     p.add_argument("--top", type=int, default=12, help="how many channels to rank and ablate")
     p.add_argument("--top-k", type=int, default=20, help="candidates printed from the answer")
     p.add_argument("--target", help="token piece to track (default: the baseline argmax)")
@@ -108,8 +113,18 @@ def main() -> int:
     key = key[0]
     row = floats(acts[key]["data"])
     logits = entry["logits"]
-    target = args.target or logits["argmax"]["piece"]
     n_vocab = logits["n_vocab"]
+
+    # the target is tracked by its token id: a piece is found only while it is among
+    # the printed candidates, and an ablation can push it out of them
+    candidates = [logits["argmax"]] + (logits.get("top") or [])
+    if args.target is None:
+        target_id, target = logits["argmax"]["id"], logits["argmax"]["piece"]
+    else:
+        found = [t for t in candidates if t["piece"] == args.target]
+        if not found:
+            raise SystemExit(f"{args.target!r} is not among the baseline's top {args.top_k} candidates; raise --top-k")
+        target_id, target = found[0]["id"], args.target
 
     print(f"  {it['meta']['n_layer']} layers, vocab {n_vocab}, prompt {it['meta']['n_prompt']} tokens; answer in {dt:.2f} s")
     print(f"  next token: {logits['argmax']['piece']!r} (id {logits['argmax']['id']}, logit {logits['argmax']['logit']:.2f}, "
@@ -117,30 +132,24 @@ def main() -> int:
     print(f"  {key}: {len(row)} channels, mean {sum(row)/len(row):.3f}, "
           f"largest |activation| {max(abs(v) for v in row):.3f}")
 
-    # the baseline distribution, exactly if we have the full row
-    if "full" in logits:
-        base_row = floats(logits["full"]["data"])
-        base_probs = softmax(base_row)
-    else:
-        base_row = None
-        base_probs = None
-
-    def prob_of(doc_logits, piece):
+    def score(doc_logits):
+        """The target's logit, probability and rank. Exact from the full row; from the
+        printed candidates otherwise, and None there once the target drops out of them."""
         if "full" in doc_logits:
             row_i = floats(doc_logits["full"]["data"])
             probs = softmax(row_i)
-            # find the piece's id among the printed candidates
-            for t in [doc_logits["argmax"]] + (doc_logits.get("top") or []):
-                if t["piece"] == piece:
-                    return probs[t["id"]], sum(1 for v in row_i if v > row_i[t["id"]]) + 1, len(row_i)
-            return None, None, len(row_i)
+            x = row_i[target_id]
+            return x, probs[target_id], sum(1 for v in row_i if v > x) + 1, probs
         for t in [doc_logits["argmax"]] + (doc_logits.get("top") or []):
-            if t["piece"] == piece:
-                return t.get("prob"), None, None
-        return None, None, None
+            if t["id"] == target_id:
+                return t["logit"], t.get("prob"), None, None
+        return None, None, None, None
 
-    base_p, base_rank, _ = prob_of(logits, target)
-    print(f"  tracking {target!r}: baseline p={base_p:.6f}" + (f", rank {base_rank}" if base_rank else ""))
+    base_logit, base_p, base_rank, base_probs = score(logits)
+    print(f"  tracking {target!r} (id {target_id}): baseline p={base_p:.6f}" + (f", rank {base_rank}" if base_rank else ""))
+
+    def num(v, spec):
+        return format(v, spec) if v is not None else format(float("nan"), spec)
 
     # candidate neurons: the channels that fire hardest at this position
     order = sorted(range(len(row)), key=lambda i: -abs(row[i]))[: args.top]
@@ -154,33 +163,24 @@ def main() -> int:
         it2, e2 = intro(doc2)
         lg2 = e2["logits"]
         mod = (it2.get("interventions") or [{}])[0].get("modified")
-        p2, rank2, _ = prob_of(lg2, target)
-        target_logit = None
-        if "full" in lg2:
-            r2 = floats(lg2["full"]["data"])
-            for t in [lg2["argmax"]] + (lg2.get("top") or []):
-                if t["piece"] == target:
-                    target_logit = r2[t["id"]]
-        if base_row is not None and "full" in lg2:
-            r2 = floats(lg2["full"]["data"])
-            ab = softmax(r2)
-            kl = sum(p * math.log(p / q) for p, q in zip(base_probs, ab) if p > 0 and q > 0)
+        logit2, p2, rank2, probs2 = score(lg2)
+        dlogit = logit2 - base_logit if logit2 is not None else None
+        if base_probs is not None and probs2 is not None:
+            kl = sum(p * math.log(p / q) for p, q in zip(base_probs, probs2) if p > 0 and q > 0)
         else:
             kl = float("nan")
-        dlogit = None
-        if target_logit is not None:
-            for t in [logits["argmax"]] + (logits.get("top") or []):
-                if t["piece"] == target:
-                    dlogit = target_logit - t["logit"]
-        results.append((abs(dlogit) if dlogit is not None else 0.0, c, row[c], dlogit, p2, rank2, kl, lg2["argmax"]["piece"], mod))
-        print(f"  {c:>7}  {row[c]:>11.4f}  {dlogit if dlogit is not None else float('nan'):>8.3f}  "
-              f"{p2 if p2 is not None else float('nan'):>12.6f}  {rank2 if rank2 else '':>7}  {kl:>13.5f}  {lg2['argmax']['piece']!r}")
+        # a target that left the printed candidates moved more than any that stayed
+        effect = abs(dlogit) if dlogit is not None else math.inf
+        results.append((effect, c, row[c], dlogit, p2, rank2, kl, lg2["argmax"]["piece"], mod))
+        print(f"  {c:>7}  {row[c]:>11.4f}  {num(dlogit, '>8.3f')}  "
+              f"{num(p2, '>12.6f')}  {rank2 if rank2 else '':>7}  {kl:>13.5f}  {lg2['argmax']['piece']!r}")
 
-    results.sort(reverse=True)
+    results.sort(key=lambda r: r[0], reverse=True)
     if results:
         _, c, a, dlogit, p2, rank2, kl, am, mod = results[0]
+        moved = f"logit {dlogit:+.3f}, p {p2:.6f}" if dlogit is not None else f"left the top {args.top_k}"
         print(f"\n  biggest single-neuron effect: {args.tensor}-{args.layer} channel {c} (activation {a:.3f}) "
-              f"-> {target!r} logit {dlogit:+.3f}, p {p2:.6f}, argmax {am!r}, KL {kl:.5f} ({mod} elements changed)")
+              f"-> {target!r} {moved}, argmax {am!r}, KL {kl:.5f} ({mod} elements changed)")
     print(f"  total {time.time() - t0:.1f} s for {1 + len(order)} requests")
     return 0
 

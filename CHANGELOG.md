@@ -10,12 +10,13 @@ v0.1.x are the upstream payload releases by cobanov.
 ### Added
 - **An opt-in endpoint for the model's own numbers**: `POST /v1/introspect` answers with the whole
   logit row at the positions you name, the top candidates with their probabilities, the entropy, and
-  one row of a named graph tensor (`l_out`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`,
+  one row of a named graph tensor (`l_out`, `ffn_swiglu`, `ffn_out`, `attn_out`, `attn_norm`, `ffn_norm`,
   `result_norm`, `result_output`) for a named layer. A request can also change one channel in place,
   with zero, scale or add, at one position or at all of them. `messages` applies the chat template
-  first. It is off by default: Settings > Developer > "Logits and activations API", or
-  `LLAMA_INTROSPECT=1`. `docs/INTROSPECTION.md` is the reference and `scripts/ps5lm-introspect.py`
-  is a client.
+  first. It is off by default: Settings > Developer > "Logits and activations API" (a change
+  restarts the app with the loaded model), or `LLAMA_INTROSPECT=1`. `docs/INTROSPECTION.md` is the
+  reference, `scripts/ps5lm-introspect.py` is a client, and `examples/interpret/neuron_ablation.py`
+  zeroes the FFN neurons (`ffn_swiglu`) of one layer one at a time.
 - The patch reads the logits from the context's own output buffer and copies the tensors out of the
   compute graph with the eval callback that llama.cpp already has, so no work is repeated and no
   request pays for it unless it asks.
