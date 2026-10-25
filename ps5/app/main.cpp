@@ -634,7 +634,6 @@ int main(int, char **) {
     // One device-local heap over the whole pool (RADV splits an APU's 2/3 to
     // 1/3), and a HOME for llama.cpp, which throws without one.
     setenv("radv_enable_unified_heap_on_apu", "true", 1);
-    }
     setenv("HOME", "/data/PS5LM", 0);
     setenv("LLAMA_CACHE", "/data/PS5LM/cache", 0);
     // Driver and backend switches to measure with, one NAME=value a line in
